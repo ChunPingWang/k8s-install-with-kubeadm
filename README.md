@@ -3038,6 +3038,569 @@ spec:
 
 ---
 
+# Service、Ingress 與 Gateway API 原理
+
+本章從 Service 四種類型出發，說明流量如何從外部世界進入叢集，並介紹 Ingress 與 Gateway API 的架構差異。
+
+---
+
+## 一、Service 四種類型完整說明
+
+### 1.1 為什麼需要 Service？
+
+Pod IP 是不穩定的：Pod 重啟、滾動更新、重新排程後 IP 都會改變。Service 提供一個**穩定的虛擬端點**，將流量分發到後端 Pod：
+
+```
+客戶端
+  │ 存取 Service（固定 IP/DNS）
+  ▼
+Service（穩定）
+  ├── Pod A（10.244.1.2）  ← 可能隨時消失重建
+  ├── Pod B（10.244.2.3）
+  └── Pod C（10.244.3.4）
+```
+
+Service 透過 **label selector** 動態追蹤後端 Pod，Endpoint Controller 維護最新的 Pod IP 清單（Endpoints 物件）。
+
+### 1.2 ClusterIP（預設）
+
+**用途：** 叢集內部服務間通訊。
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend-svc
+spec:
+  type: ClusterIP          # 預設，可省略
+  selector:
+    app: backend
+  ports:
+  - port: 80               # Service 暴露的 port
+    targetPort: 8080       # 後端 Pod 的 port
+    protocol: TCP
+```
+
+```
+叢集內部               kube-proxy（iptables）
+  curl backend-svc:80
+    │ DNS → ClusterIP 10.96.1.5
+    │
+    ▼
+  DNAT: 10.96.1.5:80 → 隨機選一個 Pod IP:8080
+    │
+    ▼
+  Pod（10.244.x.x:8080）
+```
+
+- ClusterIP 是**虛擬 IP**，不綁定任何網路介面，只存在於 iptables DNAT 規則
+- 叢集外部無法直接存取
+
+### 1.3 NodePort
+
+**用途：** 在每個 Node 上開放固定 port，允許外部直接存取。
+
+```yaml
+spec:
+  type: NodePort
+  selector:
+    app: backend
+  ports:
+  - port: 80               # ClusterIP port（叢集內部用）
+    targetPort: 8080       # Pod port
+    nodePort: 30080        # Node 上開放的 port（30000-32767）
+    # nodePort 不指定則自動分配
+```
+
+```
+外部客戶端
+  │ curl 192.168.56.11:30080（任意 Node IP）
+  ▼
+Node iptables PREROUTING
+  DNAT: NodeIP:30080 → ClusterIP:80 → Pod:8080
+  SNAT: 來源 IP 改為 Node IP（確保回程路由正確）
+```
+
+**缺點：**
+- port 範圍受限（30000–32767）
+- 每個 Service 佔用所有 Node 的同一個 port
+- 生產環境通常不直接暴露 NodePort，而是放在 LoadBalancer 或 Ingress 後面
+
+### 1.4 LoadBalancer
+
+**用途：** 在雲端環境中，自動建立外部 Load Balancer（如 AWS ALB/NLB、GCP CLB）。
+
+```yaml
+spec:
+  type: LoadBalancer
+  selector:
+    app: frontend
+  ports:
+  - port: 443
+    targetPort: 8443
+```
+
+**運作流程：**
+
+```
+kubectl apply Service (type=LoadBalancer)
+    │
+    ▼
+Cloud Controller Manager（CCM）監聽到新 Service
+    │  呼叫雲端 API（AWS / GCP / Azure）
+    ▼
+建立外部 Load Balancer（有公網 IP）
+    │
+    ▼
+Service 的 status.loadBalancer.ingress 填入公網 IP
+    │
+kubectl get svc → EXTERNAL-IP: 1.2.3.4
+
+流量路徑：
+Internet → 公網 IP（Load Balancer）→ Node:NodePort → Pod
+```
+
+**本地/裸機環境的替代方案：**
+
+雲端以外的環境沒有 CCM，LoadBalancer Service 會永遠停在 `<pending>`。替代方案：
+- **MetalLB**：為裸機環境提供 LoadBalancer 實作（ARP / BGP 模式）
+- **kube-vip**：使用 VIP 提供 HA 控制面和 LoadBalancer 功能
+
+```bash
+# 安裝 MetalLB（裸機 LoadBalancer）
+kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/v0.14.5/config/manifests/metallb-native.yaml
+
+# 設定 IP 池
+kubectl apply -f - <<EOF
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: first-pool
+  namespace: metallb-system
+spec:
+  addresses:
+  - 192.168.56.200-192.168.56.250
+---
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
+metadata:
+  name: example
+  namespace: metallb-system
+EOF
+```
+
+### 1.5 ExternalName
+
+**用途：** 將 Service 名稱對應到**外部 DNS 名稱**（CNAME），不做 L4 代理。
+
+```yaml
+spec:
+  type: ExternalName
+  externalName: my-database.prod.example.com
+  # 不需要 selector
+```
+
+```
+Pod 內部：
+  curl db-service:5432
+    │ DNS 查詢 db-service.default.svc.cluster.local
+    │ CoreDNS 回傳 CNAME → my-database.prod.example.com
+    │ 再解析外部 DNS → 真實 IP
+    ▼
+外部資料庫（my-database.prod.example.com）
+```
+
+**典型用途：**
+- 遷移期間：叢集內服務先指向外部舊系統，遷移完成後只改 ExternalName，不動 Pod 設定
+- 跨叢集存取：叢集 A 的 Service 指向叢集 B 的外部 DNS
+
+### 1.6 Headless Service（無頭服務）
+
+**用途：** 不分配 ClusterIP，DNS 直接回傳所有 Pod IP，讓客戶端自行決定連接哪個 Pod。
+
+```yaml
+spec:
+  clusterIP: None          # ← 關鍵：設為 None
+  selector:
+    app: mysql
+  ports:
+  - port: 3306
+```
+
+**DNS 行為差異：**
+
+```
+普通 Service（ClusterIP）：
+  DNS 查詢 mysql-svc.default.svc.cluster.local
+  → 回傳 ClusterIP（單一 IP）
+  → 由 iptables 做負載均衡
+
+Headless Service：
+  DNS 查詢 mysql-svc.default.svc.cluster.local
+  → 回傳所有 Pod IP（多筆 A record）
+  → 客戶端自行選擇
+
+StatefulSet 的 Headless Service 還提供 Pod DNS：
+  mysql-0.mysql-svc.default.svc.cluster.local → mysql-0 的 Pod IP
+  mysql-1.mysql-svc.default.svc.cluster.local → mysql-1 的 Pod IP
+  （穩定的 Pod DNS，即使 Pod IP 改變也不影響）
+```
+
+**StatefulSet 必須搭配 Headless Service 的原因：**
+
+```
+mysql-0 是 Primary，mysql-1/2 是 Replica
+  → Replica 需要連接「特定的」Primary（mysql-0），不能 load balance
+  → 必須有 mysql-0.mysql-svc 這樣的穩定 DNS
+  → 需要 Headless Service 提供 Pod 個別 DNS
+```
+
+### 1.7 四種 Service 類型總覽
+
+```
+ClusterIP（叢集內部）
+  Pod ──► Service（虛擬 IP）──► Pod
+  特性：僅叢集內可達，iptables DNAT 負載均衡
+
+NodePort（Node 端口暴露）
+  外部 ──► Node:30080 ──► ClusterIP ──► Pod
+  特性：所有 Node 開放同一端口，適合測試
+
+LoadBalancer（雲端整合）
+  Internet ──► 公網 LB ──► Node:NodePort ──► Pod
+  特性：需要 CCM，裸機用 MetalLB
+
+ExternalName（DNS 代理）
+  Pod ──► CoreDNS CNAME ──► 外部 DNS ──► 外部服務
+  特性：無 ClusterIP，無 iptables，純 DNS
+
+Headless（直接 Pod DNS）
+  Pod ──► DNS（全部 Pod IP）──► 選定 Pod
+  特性：clusterIP=None，StatefulSet 專用穩定 DNS
+```
+
+---
+
+## 二、Ingress 原理
+
+### 2.1 Ingress 解決的問題
+
+NodePort 和 LoadBalancer 的限制：
+
+```
+問題：每個 Service 都需要一個獨立的 LoadBalancer（昂貴）或 NodePort（端口數量有限）
+
+Service A ──► LoadBalancer（公網 IP 1）
+Service B ──► LoadBalancer（公網 IP 2）
+Service C ──► LoadBalancer（公網 IP 3）
+```
+
+Ingress 用**一個** LoadBalancer 入口，根據 HTTP Host / Path 路由到不同 Service：
+
+```
+Internet
+  │ 單一入口（80/443）
+  ▼
+Ingress Controller（nginx / traefik / ...）
+  ├── host: api.example.com     → Service: api-svc:8080
+  ├── host: www.example.com
+  │     path: /shop             → Service: shop-svc:3000
+  │     path: /blog             → Service: blog-svc:4000
+  └── TLS 終止（HTTPS → HTTP）
+```
+
+### 2.2 Ingress 的兩個組成部分
+
+**1. IngressClass + Ingress Controller（實際執行流量轉發的程式）**
+
+Ingress Controller 不是 K8s 內建元件，需要額外安裝：
+
+```bash
+# 安裝 nginx Ingress Controller（以 NodePort 方式暴露）
+kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.10.1/deploy/static/provider/baremetal/deploy.yaml
+```
+
+**2. Ingress 物件（路由規則宣告）**
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: app-ingress
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /   # Controller 特定設定
+spec:
+  ingressClassName: nginx           # 指定使用哪個 IngressClass
+  tls:
+  - hosts:
+    - api.example.com
+    secretName: api-tls-secret      # TLS 憑證（Secret 類型 kubernetes.io/tls）
+  rules:
+  - host: api.example.com           # 根據 Host header 路由
+    http:
+      paths:
+      - path: /v1
+        pathType: Prefix            # Prefix / Exact / ImplementationSpecific
+        backend:
+          service:
+            name: api-v1-svc
+            port:
+              number: 8080
+      - path: /v2
+        pathType: Prefix
+        backend:
+          service:
+            name: api-v2-svc
+            port:
+              number: 8080
+  - host: www.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: frontend-svc
+            port:
+              number: 80
+```
+
+### 2.3 pathType 三種模式
+
+| pathType | 行為 | 範例 |
+|---|---|---|
+| `Exact` | 完全匹配，區分大小寫 | `/foo` 只匹配 `/foo` |
+| `Prefix` | 前綴匹配（以 `/` 分隔） | `/foo` 匹配 `/foo`, `/foo/bar`，但不匹配 `/foobar` |
+| `ImplementationSpecific` | 由 IngressClass 的 Controller 決定 | nginx 支援正規表示式 |
+
+### 2.4 IngressClass 與多 Controller 共存
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata:
+  name: nginx
+  annotations:
+    ingressclass.kubernetes.io/is-default-class: "true"   # 設為預設
+spec:
+  controller: k8s.io/ingress-nginx
+
+---
+apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata:
+  name: traefik
+spec:
+  controller: traefik.io/ingress-controller
+```
+
+同一叢集可以有多個 Ingress Controller，Ingress 物件透過 `ingressClassName` 指定使用哪個：
+
+```
+IngressClass: nginx    ←──── Ingress A (ingressClassName: nginx)
+IngressClass: traefik  ←──── Ingress B (ingressClassName: traefik)
+```
+
+### 2.5 TLS 終止
+
+```bash
+# 建立自簽憑證
+openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+  -keyout tls.key -out tls.crt \
+  -subj "/CN=api.example.com/O=example"
+
+# 建立 TLS Secret
+kubectl create secret tls api-tls-secret \
+  --cert=tls.crt --key=tls.key
+```
+
+```
+HTTPS 流量路徑：
+  客戶端 ──HTTPS──► Ingress Controller（TLS 終止）──HTTP──► Service ──► Pod
+                    （nginx 解密，轉為明文 HTTP）
+```
+
+若需要 End-to-End TLS（不終止），nginx 支援 `nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"` annotation。
+
+### 2.6 Ingress Controller 架構圖
+
+```
+叢集外部
+  │ HTTP/HTTPS :80/:443
+  ▼
+LoadBalancer Service（或 NodePort）
+  │
+  ▼
+Ingress Controller Pod（nginx）
+  │ 監聽 Ingress 物件變化
+  │ 動態更新 nginx.conf
+  ├──► Service A → Endpoints（Pod IP:Port）
+  ├──► Service B → Endpoints（Pod IP:Port）
+  └──► Service C → Endpoints（Pod IP:Port）
+
+Ingress Controller 直接轉發到 Pod IP（繞過 ClusterIP iptables）
+→ 減少一層 DNAT，效能更好
+```
+
+---
+
+## 三、Gateway API
+
+### 3.1 Ingress 的局限
+
+Ingress API 設計於 2015 年，存在幾個根本限制：
+
+| 問題 | 說明 |
+|---|---|
+| **表達能力不足** | 只支援 HTTP Host/Path，TCP/UDP 路由需要非標準 annotation |
+| **annotation 地獄** | 進階功能（逾時、重試、流量鏡射）靠 Controller 特定 annotation，不可移植 |
+| **角色混用** | 基礎設施管理員和應用開發者共用同一個 Ingress 物件 |
+| **跨 namespace 路由困難** | 一個 Ingress 物件難以跨 namespace 管理後端 Service |
+
+### 3.2 Gateway API 三層模型
+
+Gateway API 引入角色分離：
+
+```
+叢集管理員                    平台工程師                 應用開發者
+     │                            │                          │
+     ▼                            ▼                          ▼
+GatewayClass               Gateway                    HTTPRoute / TCPRoute
+（Controller 類型）          （實際的 LB 實例）           （路由規則）
+
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: nginx-gateway
+spec:
+  controllerName: gateway.nginx.org/nginx-gateway-controller
+
+---
+kind: Gateway
+metadata:
+  name: prod-gateway
+  namespace: infra
+spec:
+  gatewayClassName: nginx-gateway
+  listeners:
+  - name: https
+    port: 443
+    protocol: HTTPS
+    tls:
+      certificateRefs:
+      - name: prod-tls
+
+---
+kind: HTTPRoute
+metadata:
+  name: api-route
+  namespace: app              # 可在不同 namespace
+spec:
+  parentRefs:
+  - name: prod-gateway
+    namespace: infra          # 跨 namespace 引用 Gateway
+  hostnames: ["api.example.com"]
+  rules:
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /v1
+    backendRefs:
+    - name: api-v1-svc
+      port: 8080
+      weight: 90             # 流量權重（金絲雀發布）
+    - name: api-v1-canary
+      port: 8080
+      weight: 10
+```
+
+### 3.3 Ingress vs Gateway API 對比
+
+| 維度 | Ingress | Gateway API |
+|---|---|---|
+| API 成熟度 | GA（v1） | GA（v1，K8s 1.31+） |
+| 協議支援 | HTTP/HTTPS | HTTP, HTTPS, TCP, UDP, TLS, gRPC |
+| 流量管理 | 基本 path/host | 重試、逾時、流量分割、鏡射（標準化） |
+| 角色分離 | 無（一個物件） | GatewayClass / Gateway / Route 三層 |
+| 跨 namespace | 困難 | 原生支援（ReferenceGrant 控制） |
+| 金絲雀發布 | 靠 annotation（不可移植） | 原生 weight 支援 |
+| 現有生態 | nginx、traefik、HAProxy... | nginx、Istio、Envoy Gateway、Cilium... |
+
+### 3.4 現階段建議
+
+```
+新專案        ─────────────────────────────────► Gateway API（未來主流）
+現有專案       ─── 繼續用 Ingress，等生態成熟後遷移
+CKA/CKAD 考試 ─── 目前仍以 Ingress 為主（Gateway API 尚未列入考綱）
+```
+
+---
+
+## 四、Service / Ingress 問題排查指引
+
+### 4.1 Service 無法連線
+
+```
+問題：curl ClusterIP:Port 無回應
+
+排查步驟：
+1. 確認 Endpoints 是否有 Pod IP
+   kubectl get endpoints <svc-name>
+   # 若 ENDPOINTS 為 <none>：selector 不符，或 Pod 未 Ready
+
+2. 確認 Pod label 與 Service selector 一致
+   kubectl get pod --show-labels
+   kubectl get svc <svc-name> -o jsonpath='{.spec.selector}'
+
+3. 確認 Pod 的 targetPort 與 containerPort 一致
+   kubectl describe pod <pod-name> | grep Port
+
+4. 從另一個 Pod 內測試
+   kubectl run test --image=busybox --rm -it -- wget -O- http://<svc-name>:<port>
+
+5. 確認 kube-proxy 是否正常
+   kubectl get pods -n kube-system | grep kube-proxy
+   kubectl logs -n kube-system <kube-proxy-pod>
+```
+
+### 4.2 Ingress 無法路由
+
+```
+問題：外部存取 Ingress URL 收到 404 或 Connection Refused
+
+排查步驟：
+1. 確認 Ingress Controller 是否運行
+   kubectl get pods -n ingress-nginx
+
+2. 確認 Ingress 物件的 ADDRESS 欄位
+   kubectl get ingress
+   # ADDRESS 為空 → Controller 未就緒或 LoadBalancer pending
+
+3. 確認 IngressClass 設定正確
+   kubectl get ingressclass
+   kubectl describe ingress <name> | grep IngressClass
+
+4. 確認後端 Service 和 Endpoints 正常
+   kubectl get svc,endpoints <backend-svc>
+
+5. 查看 Controller 日誌
+   kubectl logs -n ingress-nginx <controller-pod> | tail -50
+```
+
+### 4.3 常見錯誤對照
+
+| 症狀 | 根本原因 | 解法 |
+|---|---|---|
+| `kubectl get endpoints` 顯示 `<none>` | selector 不符 Pod label | 對齊 selector 與 Pod label |
+| Service 可達但特定 Pod 回錯誤 | targetPort 與 containerPort 不符 | 確認 port 設定 |
+| LoadBalancer `EXTERNAL-IP` 一直 `<pending>` | 無 CCM 或 MetalLB | 裸機環境安裝 MetalLB |
+| Ingress 回 `404 Not Found`（nginx） | path 不匹配或 rewrite-target 設定錯誤 | 確認 pathType 和 path 設定 |
+| Ingress 回 `503 Service Unavailable` | 後端 Service 無可用 Endpoints | 檢查 Pod 健康狀態 |
+| Ingress TLS 憑證警告 | Secret 憑證過期或 CN 不符 | 重建 TLS Secret |
+| Headless Service DNS 只回一個 IP | 客戶端 DNS 快取 | 使用 `nslookup` 確認，設定 `ndots` |
+
+---
+
 ## CKA 題目
 
 ### CKA-Q1：查看叢集狀態與節點資訊
