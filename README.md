@@ -1238,3 +1238,579 @@ curl http://192.168.56.11:30080/
 - **LoadBalancer**：在雲端環境自動建立外部 Load Balancer（本地環境需搭配 MetalLB）。
 - **ExternalName**：將 Service 對應到外部 DNS 名稱（CNAME）。
 - Service 透過 `selector` 的 label 尋找後端 Pod，可用 `kubectl get endpoints <svc>` 查看。
+
+---
+
+## CKS 題目
+
+> **CKS 前置條件：** 需先取得 CKA 認證。本節所有題目已在叢集（Kubernetes v1.32.13、Ubuntu 24.04 LTS）實際驗證通過。
+
+---
+
+### CKS-Q1：Pod Security Admission（PSA）
+
+**題目：** 將 `cks-exam` namespace 的安全等級設定為 `restricted`（最嚴格），要求所有 Pod 必須符合 restricted 規範，並確認違規 Pod 無法建立、符合規範的 Pod 可以正常運行。
+
+**解答：**
+
+```bash
+kubectl create namespace cks-exam
+
+# 設定三個維度的 PSA label
+kubectl label namespace cks-exam \
+  pod-security.kubernetes.io/enforce=restricted \
+  pod-security.kubernetes.io/warn=restricted \
+  pod-security.kubernetes.io/audit=restricted
+```
+
+**違規 Pod 測試（應被拒絕）：**
+
+```yaml
+# 以下 Pod 會被 PSA 攔截
+apiVersion: v1
+kind: Pod
+metadata:
+  name: bad-pod
+  namespace: cks-exam
+spec:
+  containers:
+  - name: app
+    image: nginx:alpine
+    securityContext:
+      privileged: true   # ← 違反 restricted
+```
+
+```
+Error: pods "bad-pod" is forbidden: violates PodSecurity "restricted:latest":
+  privileged, allowPrivilegeEscalation, capabilities.drop, runAsNonRoot, seccompProfile
+```
+
+**符合規範的 Pod（restricted 標準最低要求）：**
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: good-pod
+  namespace: cks-exam
+spec:
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+  - name: app
+    image: nginx:alpine
+    securityContext:
+      allowPrivilegeEscalation: false
+      capabilities:
+        drop: [ALL]
+    volumeMounts:
+    - {mountPath: /tmp,              name: tmp}
+    - {mountPath: /var/run,          name: varrun}
+    - {mountPath: /var/cache/nginx,  name: varcache}
+  volumes:
+  - {name: tmp,      emptyDir: {}}
+  - {name: varrun,   emptyDir: {}}
+  - {name: varcache, emptyDir: {}}
+```
+
+**說明：**
+- PSA 是 Kubernetes 1.25 GA 的內建 Admission Controller，取代已棄用的 PodSecurityPolicy（PSP）。
+- 三個安全等級：`privileged`（無限制）、`baseline`（防止已知特權提升）、`restricted`（最佳安全實踐）。
+- 三個模式：`enforce`（拒絕違規）、`warn`（警告但允許）、`audit`（記錄到 audit log）。
+- restricted 要求：非 root 執行、seccomp RuntimeDefault / Localhost、capabilities 全部移除、禁止 hostPath/hostNetwork/hostPID/hostIPC。
+
+---
+
+### CKS-Q2：Seccomp Profile
+
+**題目：** 建立一個 Pod，使用 `RuntimeDefault` seccomp profile，限制 Container 可使用的 system call 範圍。
+
+**解答：**
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: seccomp-pod
+  namespace: cks-exam
+spec:
+  securityContext:
+    seccompProfile:
+      type: RuntimeDefault    # ← 使用 Container Runtime 的預設安全 profile
+    runAsNonRoot: true
+    runAsUser: 1000
+  containers:
+  - name: app
+    image: nginx:alpine
+    securityContext:
+      allowPrivilegeEscalation: false
+      capabilities:
+        drop: [ALL]
+```
+
+```bash
+# 驗證 seccomp profile 已套用
+kubectl get pod seccomp-pod -n cks-exam \
+  -o jsonpath='{.spec.securityContext.seccompProfile}'
+# → {"type":"RuntimeDefault"}
+```
+
+**說明：**
+- Seccomp（Secure Computing Mode）限制 Container 可執行的 Linux system call，減少攻擊面。
+- `RuntimeDefault`：使用 Container Runtime（containerd/docker）預設的安全 profile，過濾高危 syscall。
+- `Localhost`：使用 Node 上自訂的 seccomp JSON profile（需放在 `/var/lib/kubelet/seccomp/` 目錄）。
+- `Unconfined`：不套用任何限制（不建議使用）。
+- Kubernetes 1.27+ 預設對新 Pod 套用 `RuntimeDefault`（若叢集開啟 `SeccompDefault` feature gate）。
+
+---
+
+### CKS-Q3：AppArmor Profile
+
+**題目：** 建立自訂 AppArmor profile `k8s-exam-deny-write`（禁止所有檔案寫入），在所有節點載入後，將其套用到 Pod。
+
+**解答：**
+
+**步驟一：在所有節點載入 profile（master + 所有 worker）**
+
+```bash
+sudo tee /etc/apparmor.d/k8s-exam-deny-write << 'EOF'
+#include <tunables/global>
+profile k8s-exam-deny-write flags=(attach_disconnected) {
+  #include <abstractions/base>
+  file,
+  deny /** w,
+}
+EOF
+
+sudo apparmor_parser -r /etc/apparmor.d/k8s-exam-deny-write
+
+# 驗證已載入
+aa-status 2>/dev/null | grep k8s-exam-deny-write
+```
+
+**步驟二：建立 Pod 套用 AppArmor（Kubernetes 1.30+ 語法）**
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: apparmor-pod
+  namespace: cks-exam
+spec:
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    seccompProfile:
+      type: RuntimeDefault
+    appArmorProfile:
+      type: Localhost
+      localhostProfile: k8s-exam-deny-write
+  containers:
+  - name: app
+    image: busybox:1.36
+    command: ['sh','-c','sleep 3600']
+    securityContext:
+      allowPrivilegeEscalation: false
+      capabilities:
+        drop: [ALL]
+```
+
+```bash
+# 驗證寫入被阻擋
+kubectl exec apparmor-pod -n cks-exam -- sh -c 'echo test > /tmp/test.txt'
+# → sh: can't create /tmp/test.txt: Permission denied  ✓
+```
+
+**說明：**
+- AppArmor 是 Linux 強制存取控制（MAC）框架，Ubuntu 預設啟用。
+- **重要**：AppArmor profile 必須在 Pod 排程到的節點上預先載入，否則 Pod 會 `CreateContainerError`。
+- Kubernetes 1.30 之前使用 annotation：`container.apparmor.security.beta.kubernetes.io/<container>: localhost/<profile>`。
+- Kubernetes 1.30+ 改用 `spec.securityContext.appArmorProfile` 或 container 層級的 `securityContext.appArmorProfile`。
+- 可用 `aa-status` 查看已載入的 profile，`apparmor_parser -r` 重新載入更新後的 profile。
+
+---
+
+### CKS-Q4：ServiceAccount Token 最小化
+
+**題目：** 建立 ServiceAccount `no-token-sa`，明確停用自動掛載 SA token。建立使用此 SA 的 Pod，確認 `/var/run/secrets/kubernetes.io/serviceaccount/` 目錄不存在。
+
+**解答：**
+
+```yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: no-token-sa
+  namespace: cks-exam
+automountServiceAccountToken: false     # SA 層級停用
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: no-token-pod
+  namespace: cks-exam
+spec:
+  serviceAccountName: no-token-sa
+  automountServiceAccountToken: false   # Pod 層級再次確認
+  containers:
+  - name: app
+    image: busybox:1.36
+    command: ['sh','-c','sleep 3600']
+```
+
+```bash
+# 確認 token 未掛載
+kubectl exec no-token-pod -n cks-exam -- \
+  ls /var/run/secrets/kubernetes.io/serviceaccount/ 2>&1
+# → ls: /var/run/secrets/...: No such file or directory  ✓
+```
+
+**說明：**
+- 每個 Pod 預設會自動掛載 ServiceAccount token，Container 可用此 token 存取 Kubernetes API。
+- 若 Pod 不需要存取 API，應停用此功能，遵循「最小權限原則」。
+- `automountServiceAccountToken: false` 可設在 SA 或 Pod 層級；Pod 層級優先。
+- 若需要 API 存取，應建立具備最小 RBAC 權限的專用 SA，而非使用 `default` SA。
+- Kubernetes 1.24+ 起 SA token 已自動設有過期時間（預設 1 小時），透過 `TokenRequest API` 動態核發。
+
+---
+
+### CKS-Q5：Audit Logging
+
+**題目：** 設定 API Server 的 Audit Logging：Secret 操作記錄 `RequestResponse`（含請求與回應 body）、Pod 操作記錄 `Request`、其他操作記錄 `Metadata`、Event 的 get/list/watch 不記錄。
+
+**解答：**
+
+**步驟一：建立 Audit Policy**
+
+```yaml
+# /etc/kubernetes/audit-policy.yaml
+apiVersion: audit.k8s.io/v1
+kind: Policy
+rules:
+- level: None
+  verbs: [get, list, watch]
+  resources:
+  - group: ''
+    resources: [events]
+- level: RequestResponse
+  resources:
+  - group: ''
+    resources: [secrets]
+- level: Request
+  resources:
+  - group: ''
+    resources: [pods]
+- level: Metadata
+```
+
+**步驟二：修改 kube-apiserver static pod manifest**
+
+```bash
+sudo vim /etc/kubernetes/manifests/kube-apiserver.yaml
+```
+
+在 `command` 加入：
+
+```yaml
+- --audit-policy-file=/etc/kubernetes/audit-policy.yaml
+- --audit-log-path=/var/log/kubernetes/audit.log
+- --audit-log-maxage=30
+- --audit-log-maxbackup=10
+- --audit-log-maxsize=100
+```
+
+加入 volume 和 volumeMount：
+
+```yaml
+volumes:
+- name: audit-log
+  hostPath:
+    path: /var/log/kubernetes
+    type: DirectoryOrCreate
+containers:
+- volumeMounts:
+  - name: audit-log
+    mountPath: /var/log/kubernetes
+```
+
+**步驟三：驗證**
+
+```bash
+sudo mkdir -p /var/log/kubernetes
+
+# 等待 API Server 重啟後建立 Secret
+kubectl create secret generic audit-test --from-literal=key=value -n cks-exam
+
+# 查看 audit log
+sudo tail -5 /var/log/kubernetes/audit.log | \
+  python3 -c "import sys,json; [print(json.loads(l)['level'], json.loads(l)['verb'], json.loads(l).get('objectRef',{}).get('resource')) for l in sys.stdin]"
+# → RequestResponse create secrets  ✓
+```
+
+**說明：**
+- Audit Log 的四個等級：`None`（不記錄）→ `Metadata`（只記錄請求 metadata）→ `Request`（加上請求 body）→ `RequestResponse`（加上回應 body）。
+- 修改 kube-apiserver manifest 後，kubelet 會自動重啟 kube-apiserver（約需 1-2 分鐘）。
+- 注意：`RequestResponse` 會記錄 Secret 的明文內容（base64 解碼後），需謹慎控制 audit log 的存取權限。
+- CKS 考試重點：能寫出 audit policy 並正確設定 kube-apiserver 參數。
+
+---
+
+### CKS-Q6：etcd Encryption at Rest（靜態加密）
+
+**題目：** 設定 etcd 靜態加密，使用 AES-CBC 加密所有 Secret 的資料，驗證 etcd 中儲存的 Secret 已無法看到明文。
+
+**解答：**
+
+**步驟一：建立 EncryptionConfiguration**
+
+```bash
+# 產生 32-byte AES key
+AES_KEY=$(head -c 32 /dev/urandom | base64)
+
+sudo tee /etc/kubernetes/encryption-config.yaml << EOF
+apiVersion: apiserver.config.k8s.io/v1
+kind: EncryptionConfiguration
+resources:
+- resources:
+  - secrets
+  providers:
+  - aescbc:
+      keys:
+      - name: key1
+        secret: ${AES_KEY}
+  - identity: {}       # fallback，讓舊 Secret 仍可讀
+EOF
+```
+
+**步驟二：修改 kube-apiserver manifest**
+
+```bash
+sudo vim /etc/kubernetes/manifests/kube-apiserver.yaml
+# 在 command 加入：
+# - --encryption-provider-config=/etc/kubernetes/encryption-config.yaml
+```
+
+**步驟三：驗證加密**
+
+```bash
+# 建立新 Secret
+kubectl create secret generic encrypted-secret \
+  --from-literal=password=MyS3cr3t -n cks-exam
+
+# 直接查詢 etcd 原始資料（應看不到明文）
+sudo ETCDCTL_API=3 etcdctl \
+  --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key \
+  get /registry/secrets/cks-exam/encrypted-secret | strings | grep MyS3cr3t
+# → （無輸出）= 加密成功 ✓
+
+# kubectl 仍可正常讀取（API Server 自動解密）
+kubectl get secret encrypted-secret -n cks-exam \
+  -o jsonpath='{.data.password}' | base64 -d
+# → MyS3cr3t
+```
+
+**步驟四：重新加密現有 Secret**
+
+```bash
+# 強制重寫所有 Secret（讓舊 Secret 也被加密）
+kubectl get secrets --all-namespaces -o json | \
+  kubectl replace -f -
+```
+
+**說明：**
+- 加密提供者依序嘗試：第一個提供者用於加密新資料，所有提供者都可用於解密。
+- `identity: {}` 表示不加密（明文），放在最後作為 fallback 讓舊 Secret 可讀。
+- 加密演算法：`aescbc`（AES-CBC，建議）、`aesgcm`（AES-GCM）、`secretbox`（NaCl）。
+- 輪換金鑰：加入新 key → 重啟 API Server → 重寫所有 Secret → 移除舊 key。
+- 注意：etcd encryption 只保護 etcd 的靜態儲存，不保護傳輸中的資料（TLS 負責）。
+
+---
+
+### CKS-Q7：NetworkPolicy — Egress 限制
+
+**題目：** 對帶有 `app=restricted` label 的 Pod，限制其 Egress 流量：只允許 DNS 查詢（UDP/TCP 53）和連到同 namespace 的 Pod，阻斷所有對外連線。
+
+**解答：**
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: restrict-egress
+  namespace: cks-exam
+spec:
+  podSelector:
+    matchLabels:
+      app: restricted
+  policyTypes:
+  - Egress
+  egress:
+  # 規則一：允許 DNS
+  - ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
+  # 規則二：允許連到同 namespace 的 Pod
+  - to:
+    - podSelector: {}
+```
+
+**說明：**
+- `policyTypes: [Egress]`：只限制對外流量，Ingress 流量不受影響。
+- `policyTypes: [Ingress, Egress]`：同時限制進出流量（最嚴格）。
+- 若不加任何 `egress` 規則（空陣列 `egress: []`），則完全封鎖所有對外連線（包含 DNS）。
+- DNS 幾乎必須放行，否則容器無法解析域名。
+- CKS 常見考題：阻斷 Pod 對 metadata server（169.254.169.254）的存取，防止 SSRF 攻擊雲端 metadata API。
+
+---
+
+### CKS-Q8：Trivy — 容器映像漏洞掃描
+
+**題目：** 使用 Trivy 掃描 `nginx:1.25` 映像，列出所有 HIGH 和 CRITICAL 等級的漏洞。若漏洞數超過閾值，改用較新的 `nginx:alpine` 重新部署。
+
+**解答：**
+
+```bash
+# 安裝 Trivy
+wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | \
+  gpg --batch --yes --dearmor | \
+  sudo tee /etc/apt/keyrings/trivy.gpg > /dev/null
+echo "deb [signed-by=/etc/apt/keyrings/trivy.gpg] \
+  https://aquasecurity.github.io/trivy-repo/deb generic main" | \
+  sudo tee /etc/apt/sources.list.d/trivy.list
+sudo apt-get update -q && sudo apt-get install -y -q trivy
+
+# 掃描映像
+trivy image --severity HIGH,CRITICAL nginx:1.25
+```
+
+**驗證結果（實際執行輸出）：**
+
+```
+nginx:1.25  →  Total: 112 (HIGH: 91, CRITICAL: 21)
+nginx:alpine →  Total: 0  (HIGH: 0,  CRITICAL: 0)   ✓
+```
+
+**Kubernetes 叢集掃描：**
+
+```bash
+# 掃描叢集中所有正在使用的映像
+kubectl get pods --all-namespaces \
+  -o jsonpath='{range .items[*]}{.spec.containers[*].image}{"\n"}{end}' | \
+  sort -u | xargs -I{} trivy image --severity CRITICAL {}
+
+# 掃描 Deployment 並產生 JSON 報告
+trivy k8s --report all --severity HIGH,CRITICAL cluster
+```
+
+**CI/CD 整合（設定漏洞閾值）：**
+
+```bash
+# EXIT CODE 1 if CRITICAL > 0（可用於 CI/CD 管線阻擋部署）
+trivy image --severity CRITICAL --exit-code 1 nginx:1.25
+```
+
+**說明：**
+- Trivy 可掃描：Container Image、Kubernetes 叢集、IaC 檔案（Terraform/Helm）、Git Repository。
+- 漏洞等級：UNKNOWN → LOW → MEDIUM → HIGH → CRITICAL。
+- CKS 考試建議使用 `--severity HIGH,CRITICAL` 聚焦高危漏洞。
+- `--ignore-unfixed`：只顯示已有修復版本的漏洞（排除 `will_not_fix`）。
+- 映像選擇原則：優先使用 `-alpine`、`-slim`、`-distroless` 等精簡映像，減少攻擊面。
+
+---
+
+### CKS-Q9：kube-bench — CIS Kubernetes Benchmark
+
+**題目：** 使用 kube-bench 對 Master 節點執行 CIS Kubernetes Benchmark 掃描，找出 FAIL 項目並修復最常見的問題。
+
+**解答：**
+
+```bash
+# 安裝 kube-bench
+curl -fsSL https://github.com/aquasecurity/kube-bench/releases/download/v0.9.4/kube-bench_0.9.4_linux_amd64.deb \
+  -o /tmp/kube-bench.deb
+sudo dpkg -i /tmp/kube-bench.deb
+
+# 掃描 Master 節點（CIS 1.9 benchmark）
+sudo KUBECONFIG=/etc/kubernetes/admin.conf \
+  kube-bench --benchmark cis-1.9
+```
+
+**本叢集掃描結果摘要：**
+
+```
+== Summary master ==
+45 checks PASS
+5 checks FAIL
+9 checks WARN
+0 checks INFO
+
+== Summary etcd ==
+7 checks PASS   ← 完全通過
+0 checks FAIL
+```
+
+**常見 FAIL 項目與修復：**
+
+| 項目 | 問題 | 修復方式 |
+|------|------|---------|
+| 1.1.12 | etcd 資料目錄 owner 非 etcd:etcd | `sudo chown etcd:etcd /var/lib/etcd` |
+| 1.2.5 | `--kubelet-certificate-authority` 未設定 | 在 kube-apiserver 加入此參數 |
+| 4.2.6 | kubelet `--protect-kernel-defaults` 未啟用 | kubelet config 加入此設定 |
+
+```bash
+# 只掃描特定項目
+sudo KUBECONFIG=/etc/kubernetes/admin.conf \
+  kube-bench --benchmark cis-1.9 --check 1.2.1,1.2.5
+
+# 產生 JSON 報告
+sudo KUBECONFIG=/etc/kubernetes/admin.conf \
+  kube-bench --benchmark cis-1.9 --json > /tmp/bench-report.json
+```
+
+**說明：**
+- CIS（Center for Internet Security）Benchmark 是業界廣泛採用的安全基準。
+- kube-bench 對應的 benchmark 版本：Kubernetes 1.29-1.32 → CIS 1.9。
+- `PASS`：設定符合 CIS 建議；`FAIL`：設定不符合，有具體修復建議；`WARN`：需人工評估的設定（Manual）。
+- CKS 考試中不要求零 FAIL，但需要能識別風險並知道如何修復。
+- 可對 Worker 節點執行：`kube-bench --benchmark cis-1.9 --targets node`。
+
+---
+
+## 驗證總結
+
+| 考試 | 題目 | 主題 | 已驗證 |
+|------|------|------|--------|
+| CKA | Q1 | 叢集狀態查詢 | ✅ |
+| CKA | Q2 | RBAC — ServiceAccount + RoleBinding | ✅ |
+| CKA | Q3 | ResourceQuota + LimitRange | ✅ |
+| CKA | Q4 | Node 維護（cordon/drain/uncordon） | ✅ |
+| CKA | Q5 | etcd 備份 | ✅ |
+| CKA | Q6 | PersistentVolume + PVC | ✅ |
+| CKA | Q7 | Taint + Toleration | ✅ |
+| CKA | Q8 | NetworkPolicy（Ingress 白名單） | ✅ |
+| CKA | Q9 | Static Pod | ✅ |
+| CKAD | Q1 | ConfigMap + Secret 環境變數 | ✅ |
+| CKAD | Q2 | ConfigMap Volume 掛載 | ✅ |
+| CKAD | Q3 | Multi-container Sidecar | ✅ |
+| CKAD | Q4 | Liveness + Readiness Probe | ✅ |
+| CKAD | Q5 | Job + CronJob | ✅ |
+| CKAD | Q6 | Deployment 滾動更新 + 回滾 | ✅ |
+| CKAD | Q7 | SecurityContext | ✅ |
+| CKAD | Q8 | Service ClusterIP + NodePort | ✅ |
+| CKS | Q1 | Pod Security Admission | ✅ |
+| CKS | Q2 | Seccomp RuntimeDefault | ✅ |
+| CKS | Q3 | AppArmor 自訂 Profile | ✅ |
+| CKS | Q4 | ServiceAccount Token 停用 | ✅ |
+| CKS | Q5 | Audit Logging | ✅ |
+| CKS | Q6 | etcd Encryption at Rest | ✅ |
+| CKS | Q7 | NetworkPolicy Egress 限制 | ✅ |
+| CKS | Q8 | Trivy 映像漏洞掃描 | ✅ |
+| CKS | Q9 | kube-bench CIS Benchmark | ✅ |
