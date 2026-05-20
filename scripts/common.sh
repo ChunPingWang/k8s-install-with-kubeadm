@@ -1,5 +1,5 @@
 #!/bin/bash
-# 所有節點（master + worker）共用的初始化腳本
+# 所有節點（master + worker）共用的初始化腳本（Ubuntu 24.04）
 set -euo pipefail
 
 NODE_IP="${NODE_IP}"

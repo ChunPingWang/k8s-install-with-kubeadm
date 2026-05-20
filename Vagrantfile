@@ -4,9 +4,8 @@
 # Kubernetes minor version (controls which apt repo is used)
 K8S_VERSION = "1.32"
 
-# Ubuntu 26.04 LTS Vagrant box
-# 若找不到此 box，可改用 "bento/ubuntu-24.04" 暫代
-BOX_NAME = "bento/ubuntu-26.04"
+# Ubuntu 24.04 LTS Vagrant box
+BOX_NAME = "bento/ubuntu-24.04"
 
 NODES = [
   { name: "k8s-master",  ip: "192.168.56.10", memory: 4096, cpus: 2, role: "master" },

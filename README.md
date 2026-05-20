@@ -1,6 +1,6 @@
-# 使用 kubeadm 安裝 Kubernetes 叢集（Ubuntu 26.04 Server）
+# 使用 kubeadm 安裝 Kubernetes 叢集（Ubuntu 24.04 Server）
 
-本指南說明如何在 Ubuntu 26.04 LTS Server 上，使用 kubeadm 建立三節點 Kubernetes 叢集。
+本指南說明如何在 Ubuntu 24.04 LTS Server 上，使用 kubeadm 建立三節點 Kubernetes 叢集。
 
 提供兩種安裝方式：
 - **方法一：Vagrant 自動化安裝**（推薦，適合本地開發測試）
@@ -59,7 +59,7 @@ kubectl get pods -A
 
 ### 注意事項
 
-1. **Vagrant Box**：預設使用 `bento/ubuntu-26.04`。若該 box 尚未發布，可在 `Vagrantfile` 第一行修改為 `bento/ubuntu-24.04`。
+1. **Vagrant Box**：預設使用 `bento/ubuntu-24.04`。若該 box 尚未發布，可在 `Vagrantfile` 第一行修改為 `bento/ubuntu-24.04`。
 2. **佈建順序**：Vagrant 依定義順序依序佈建（master → worker1 → worker2），Worker 腳本會自動等待 Master 完成。
 3. **VirtualBox Host-only 網路**：VirtualBox 6.1.28+ 預設允許 `192.168.56.0/21` 網段，本指南使用的 IP（192.168.56.10-12）在此範圍內。
 4. **重新佈建**：若需重建叢集，執行 `vagrant destroy -f && vagrant up`。
@@ -131,7 +131,7 @@ sudo sysctl --system
 
 ### 6. 安裝 containerd
 
-Ubuntu 26.04 的官方套件庫已內建 containerd，可直接安裝：
+Ubuntu 24.04 的官方套件庫已內建 containerd，可直接安裝：
 
 ```bash
 sudo apt-get update
@@ -284,7 +284,7 @@ net-conf.json: |
   - --iface=enp0s8
 ```
 
-> **注意：** Ubuntu 26.04 的網路介面名稱可能有所不同，請執行 `ip link` 確認後填入正確介面名稱。
+> **注意：** Ubuntu 24.04 的網路介面名稱可能有所不同，請執行 `ip link` 確認後填入正確介面名稱。
 
 ### 3. 套用 Flannel
 
