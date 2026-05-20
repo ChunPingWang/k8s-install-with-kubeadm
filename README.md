@@ -2,6 +2,72 @@
 
 本指南說明如何在 Ubuntu 26.04 LTS Server 上，使用 kubeadm 建立三節點 Kubernetes 叢集。
 
+提供兩種安裝方式：
+- **方法一：Vagrant 自動化安裝**（推薦，適合本地開發測試）
+- **方法二：手動逐步安裝**（適合正式環境或學習每個步驟）
+
+---
+
+## 方法一：Vagrant + VirtualBox 自動化安裝
+
+### 前置需求
+
+- [VirtualBox](https://www.virtualbox.org/) 7.x
+- [Vagrant](https://www.vagrantup.com/) 2.4+
+- 主機需有至少 **10GB 可用記憶體**（Master 4GB + 2x Worker 2GB + 主機 OS 保留）
+- 主機需有至少 **50GB 可用磁碟空間**
+
+### 目錄結構
+
+```
+.
+├── Vagrantfile
+├── README.md
+└── scripts/
+    ├── common.sh   # 所有節點共用（containerd、kubeadm、kubelet、kubectl）
+    ├── master.sh   # Master 節點初始化與 Flannel 部署
+    └── worker.sh   # Worker 節點加入叢集
+```
+
+### 快速啟動
+
+```bash
+# 複製本專案
+git clone https://github.com/ChunPingWang/k8s-install-with-kubeadm.git
+cd k8s-install-with-kubeadm
+
+# 啟動全部節點（約 15-25 分鐘）
+vagrant up
+
+# 驗證叢集狀態（在 master 上執行）
+vagrant ssh k8s-master
+kubectl get nodes -o wide
+kubectl get pods -A
+```
+
+### 常用 Vagrant 指令
+
+| 指令 | 說明 |
+|------|------|
+| `vagrant up` | 啟動並佈建所有節點 |
+| `vagrant up k8s-master` | 僅啟動 master |
+| `vagrant ssh k8s-master` | SSH 進入 master |
+| `vagrant ssh k8s-worker1` | SSH 進入 worker1 |
+| `vagrant halt` | 關閉所有節點 |
+| `vagrant destroy -f` | 刪除所有節點 |
+| `vagrant status` | 查看節點狀態 |
+
+### 注意事項
+
+1. **Vagrant Box**：預設使用 `bento/ubuntu-26.04`。若該 box 尚未發布，可在 `Vagrantfile` 第一行修改為 `bento/ubuntu-24.04`。
+2. **佈建順序**：Vagrant 依定義順序依序佈建（master → worker1 → worker2），Worker 腳本會自動等待 Master 完成。
+3. **VirtualBox Host-only 網路**：VirtualBox 6.1.28+ 預設允許 `192.168.56.0/21` 網段，本指南使用的 IP（192.168.56.10-12）在此範圍內。
+4. **重新佈建**：若需重建叢集，執行 `vagrant destroy -f && vagrant up`。
+
+---
+
+## 方法二：手動逐步安裝
+
 ## 環境需求
 
 | 主機名稱 | IP 位址 | 記憶體 |
