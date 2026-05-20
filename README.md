@@ -66,7 +66,307 @@ kubectl get pods -A
 
 ---
 
-## 方法二：手動逐步安裝
+## Kubernetes 架構原理
+
+在動手安裝之前，先建立對整體架構的認識。理解每個元件的職責，才能看懂安裝步驟的用意，以及遇到問題時知道從哪裡下手。
+
+---
+
+### 宣告式模型（Declarative Model）
+
+Kubernetes 的核心思想是**宣告式（Declarative）**：你告訴 Kubernetes「我想要什麼狀態」，而不是「請執行哪些步驟」。
+
+```
+命令式（Imperative）：「啟動 3 個 nginx container，然後設定 load balancer，再...」
+宣告式（Declarative）：「我想要 3 個 nginx Pod 永遠在跑」
+```
+
+Kubernetes 持續比較「目前狀態」與「期望狀態」，有差異就自動修正。這個機制稱為 **Control Loop（控制迴圈）** 或 **Reconciliation Loop（調和迴圈）**。
+
+```
+┌─────────────────────────────────────────────────────┐
+│                   Control Loop                       │
+│                                                      │
+│   Observe           Compare           Act            │
+│   觀察現況   ──►   比較期望   ──►   執行調整          │
+│      ▲                                  │            │
+│      └──────────────────────────────────┘            │
+│                                                      │
+│  例：ReplicaSet 要求 3 個 Pod，目前只有 2 個           │
+│  → Controller 自動建立第 3 個 Pod                     │
+└─────────────────────────────────────────────────────┘
+```
+
+---
+
+### 整體架構
+
+```
+                    kubectl / 外部 API 請求
+                            │
+                            │ HTTPS :6443
+                            ▼
+┌───────────────────────────────────────────────────────────────┐
+│                    Control Plane（Master Node）                 │
+│                                                               │
+│  ┌─────────────────┐     ┌─────────────────────────────────┐  │
+│  │  kube-apiserver │◄───►│            etcd                 │  │
+│  │  （唯一入口）    │     │  （叢集狀態儲存 / Raft 共識）    │  │
+│  └────────┬────────┘     └─────────────────────────────────┘  │
+│           │ Watch / Notify                                     │
+│     ┌─────┴──────────────────────┐                            │
+│     ▼                            ▼                            │
+│  ┌──────────────┐    ┌─────────────────────────────────────┐  │
+│  │kube-scheduler│    │      kube-controller-manager         │  │
+│  │（Pod 排程）  │    │  （Node / ReplicaSet / Endpoint 等   │  │
+│  │              │    │   數十個 Controller 的集合體）         │  │
+│  └──────────────┘    └─────────────────────────────────────┘  │
+└───────────────────────────────────────────────────────────────┘
+          │  kubelet 主動向 API Server 發起 HTTPS 連線
+          ├─────────────────┬───────────────────────┐
+          ▼                 ▼                       ▼
+┌──────────────────┐ ┌──────────────────┐ ┌──────────────────┐
+│  Worker Node 1   │ │  Worker Node 2   │ │  Worker Node 3   │
+│                  │ │                  │ │                  │
+│  ┌────────────┐  │ │  ┌────────────┐  │ │  ┌────────────┐  │
+│  │  kubelet   │  │ │  │  kubelet   │  │ │  │  kubelet   │  │
+│  │（Pod 生命  │  │ │  │            │  │ │  │            │  │
+│  │  週期管理）│  │ │  │            │  │ │  │            │  │
+│  ├────────────┤  │ │  ├────────────┤  │ │  ├────────────┤  │
+│  │ kube-proxy │  │ │  │ kube-proxy │  │ │  │ kube-proxy │  │
+│  │（Service   │  │ │  │ iptables / │  │ │  │  路由規則） │  │
+│  │  路由規則） │  │ │  │  ipvs 規則 │  │ │  │            │  │
+│  ├────────────┤  │ │  ├────────────┤  │ │  ├────────────┤  │
+│  │ containerd │  │ │  │ containerd │  │ │  │ containerd │  │
+│  │（容器執行期）│ │  │（OCI Runtime）│ │  │            │  │
+│  └────────────┘  │ │  └────────────┘  │ │  └────────────┘  │
+│  ┌───┐ ┌───┐    │ │  ┌───┐ ┌───┐    │ │  ┌───┐ ┌───┐    │
+│  │Pod│ │Pod│    │ │  │Pod│ │Pod│    │ │  │Pod│ │Pod│    │
+│  └───┘ └───┘    │ │  └───┘ └───┘    │ │  └───┘ └───┘    │
+└──────────────────┘ └──────────────────┘ └──────────────────┘
+      ════════════ Pod 網路（Flannel VXLAN Overlay） ═══════════
+      所有 Pod 共用 CIDR 10.244.0.0/16，跨節點可互相直連
+```
+
+---
+
+### Control Plane 元件詳解
+
+#### kube-apiserver — 叢集的唯一入口
+
+API Server 是整個叢集的**核心閘道**。所有操作（kubectl、Controller、kubelet）都只和 API Server 溝通，沒有任何元件直接存取 etcd。
+
+```
+外部請求  →  Authentication（身份驗證）
+            →  Authorization / RBAC（授權）
+               →  Admission Controllers（准入控制，如 PSA、ResourceQuota）
+                  →  Persist to etcd（寫入儲存）
+                     →  通知 Watch 的元件
+```
+
+**為什麼只有 API Server 可以存取 etcd？**
+將 etcd 存取收斂到單一元件，才能統一執行身份驗證、授權、資料驗證。若每個元件都能直接寫 etcd，安全性與資料一致性無從保障。
+
+---
+
+#### etcd — 叢集狀態的唯一真相來源
+
+etcd 是一個**分散式 key-value 儲存系統**，使用 **Raft 共識演算法**確保多個副本之間的資料一致性。
+
+**儲存內容：** Pod、Deployment、Service、ConfigMap、Secret、RBAC 規則…所有 Kubernetes 物件。
+
+**Raft 共識：** 在多節點的 etcd 叢集中，寫入操作需要多數節點（quorum）確認才算成功。例如 3 節點叢集需要 2 個節點確認；這使得 etcd 能夠容忍 1 個節點故障。
+
+```
+3 節點 etcd 叢集：
+  Node A（Leader）  ← 寫入請求
+  Node B（Follower）← 複製
+  Node C（Follower）← 複製
+  需要 A+B 或 A+C 確認 → 可容忍 1 個節點故障
+```
+
+**為什麼備份 etcd 等同於備份整個叢集？** 因為所有叢集狀態都在這裡，從這份 snapshot 可以完整還原叢集。
+
+---
+
+#### kube-scheduler — Pod 排程決策
+
+Scheduler 持續 Watch API Server，一旦發現有尚未分配節點（`nodeName` 為空）的 Pod，就執行排程演算法，選出最合適的節點，然後更新 Pod 的 `nodeName` 欄位。
+
+**排程流程：**
+
+```
+1. Filtering（過濾）：排除不符合條件的節點
+   - 資源不足（CPU/Memory request > 可用資源）
+   - 有 Taint 但 Pod 沒有對應 Toleration
+   - NodeSelector / NodeAffinity 不符合
+   - Pod 的 hostPort 衝突
+   - 節點不健康（NotReady）
+
+2. Scoring（評分）：對剩餘節點打分
+   - 資源均衡（避免某節點過熱）
+   - Affinity / Anti-Affinity 偏好
+   - 映像已在節點上（省去拉取時間）
+
+3. Binding（綁定）：寫入 Pod.spec.nodeName
+```
+
+Scheduler **不執行** Pod，只做決策。實際啟動 Pod 的是 kubelet。
+
+---
+
+#### kube-controller-manager — 所有 Controller 的集合體
+
+Controller Manager 跑著數十個 Controller，每個 Controller 負責一種資源的「期望狀態 vs 實際狀態」調和。
+
+| Controller | 職責 |
+|---|---|
+| ReplicaSet Controller | 確保 Pod 數量與 ReplicaSet 要求一致 |
+| Deployment Controller | 管理 ReplicaSet 的滾動更新 |
+| Node Controller | 偵測節點失聯，標記 NotReady |
+| Endpoint Controller | 維護 Service 與 Pod 的對應關係 |
+| ServiceAccount Controller | 自動為新 Namespace 建立 default SA |
+| Job Controller | 確保 Job 完成指定次數 |
+
+每個 Controller 都是一個獨立的 Control Loop，互不干擾。
+
+---
+
+### Worker Node 元件詳解
+
+#### kubelet — 節點上的「代理人」
+
+kubelet 是每個 Worker Node（以及 Master Node）上的守護程式，負責：
+
+1. 向 API Server 註冊自己（Node 物件）
+2. Watch API Server，接收分配到本節點的 Pod Spec
+3. 呼叫 CRI（Container Runtime Interface）啟動容器
+4. 持續回報 Pod 狀態、節點資源使用量
+5. 執行 Liveness / Readiness Probe
+6. 管理 Static Pod（直接讀取 `/etc/kubernetes/manifests/`）
+
+**kubelet 與 API Server 的通訊方向：** kubelet **主動連向** API Server（HTTPS :6443），而非 API Server 推送給 kubelet。這設計使得 Worker Node 不需要開放任何 port 給 Master。
+
+---
+
+#### kube-proxy — Service 網路的實作者
+
+kube-proxy 讓 Kubernetes **Service** 能夠運作。它 Watch API Server 上的 Service 和 Endpoints，將對應的路由規則寫入作業系統：
+
+```
+預設模式（iptables）：
+  Service ClusterIP:Port
+    → iptables DNAT 規則
+      → 隨機選取一個後端 Pod IP:Port
+
+IPVS 模式（效能更佳）：
+  使用 Linux IPVS（LVS）做 load balancing
+  適合大規模叢集（數千個 Service）
+```
+
+**kube-proxy 不處理 Pod-to-Pod 通訊**，那是 CNI 的職責。
+
+---
+
+#### containerd — OCI 標準容器執行期
+
+containerd 是實際**執行容器**的程式，實作了 **CRI（Container Runtime Interface）**，讓 kubelet 可以呼叫它：
+
+```
+kubelet
+  → CRI（gRPC）
+    → containerd
+      → runc（OCI Runtime，真正的 Linux container）
+        → 隔離的 cgroup / namespace
+```
+
+**containerd 的職責：**
+- 從 Registry 拉取映像（Image Pull）
+- 管理映像的 Overlay Filesystem 層（UnionFS）
+- 使用 runc 建立 cgroup、namespace 並啟動 container
+- 管理 container 生命週期（start / stop / delete）
+
+---
+
+### 一個 Pod 從建立到運行的完整旅程
+
+```
+$ kubectl apply -f pod.yaml
+        │
+        ▼
+[1] kube-apiserver
+    - 驗證身份（TLS 客戶端憑證 / Bearer Token）
+    - 授權檢查（RBAC：你有權建立 Pod 嗎？）
+    - Admission Control（ResourceQuota 夠嗎？PSA 符合嗎？）
+    - 將 Pod 物件（spec.nodeName = ""）寫入 etcd
+        │
+        ▼
+[2] kube-scheduler（Watch 到新的 Unscheduled Pod）
+    - 執行 Filtering + Scoring
+    - 選出最佳節點（例如 k8s-worker1）
+    - 更新 Pod.spec.nodeName = "k8s-worker1" → 寫入 etcd
+        │
+        ▼
+[3] kubelet on k8s-worker1（Watch 到分配給自己的 Pod）
+    - 呼叫 CNI 插件（Flannel）分配 Pod IP
+    - 呼叫 containerd（CRI）：
+        → 拉取映像（若不在 local cache）
+        → 建立 Pod sandbox（pause container：持有 Network namespace）
+        → 啟動應用 container，加入 sandbox 的 network namespace
+    - 執行 Readiness Probe，通過後回報 Pod Ready
+        │
+        ▼
+[4] Endpoint Controller
+    - 偵測到 Pod Ready，將 Pod IP 加入對應 Service 的 Endpoints
+        │
+        ▼
+[5] kube-proxy on 所有節點
+    - Watch 到 Endpoints 更新
+    - 更新 iptables / IPVS 規則
+    - Service 現在可以正確路由到新的 Pod
+```
+
+整個過程通常在 **5-30 秒**內完成（取決於映像大小與節點資源）。
+
+---
+
+### Pod 網路模型（Flannel / VXLAN）
+
+Kubernetes 要求所有 Pod 之間可以**直接通訊**（不需要 NAT），且每個 Pod 有唯一的 IP。這個要求由 **CNI（Container Network Interface）** 插件實現。
+
+**Flannel 的 VXLAN 模式：**
+
+```
+Node 1 (192.168.56.11)          Node 2 (192.168.56.12)
+┌──────────────────────┐         ┌──────────────────────┐
+│  Pod A  10.244.1.10  │         │  Pod B  10.244.2.20  │
+│         │            │         │         ▲            │
+│      eth0（veth）    │         │      eth0（veth）    │
+│         │            │         │         │            │
+│      cni0（bridge）  │         │      cni0（bridge）  │
+│         │            │         │         │            │
+│      flannel.1       │         │      flannel.1       │
+│   （VTEP: VXLAN 端點）│         │   （VTEP: VXLAN 端點）│
+│         │            │         │         │            │
+│      eth1（實體網卡） │─────────│      eth1（實體網卡） │
+│   192.168.56.11      │ UDP/8472│   192.168.56.12      │
+└──────────────────────┘         └──────────────────────┘
+```
+
+**封包路徑（Pod A → Pod B）：**
+
+1. Pod A 送出封包：`src=10.244.1.10 dst=10.244.2.20`
+2. flannel.1（VTEP）將原始封包封裝進 VXLAN frame
+3. 外層封包：`src=192.168.56.11 dst=192.168.56.12`（節點 IP）
+4. 實體網路傳輸
+5. Node 2 的 flannel.1 解封裝，還原原始封包
+6. 路由到 Pod B
+
+這就是為什麼安裝時需要 `--pod-network-cidr` 和指定 `--iface`（讓 Flannel 知道用哪個實體介面做 VXLAN 封裝）。
+
+---
+
+## 方法二：手動逐步安裝（含原理說明）
 
 ## 環境需求
 
@@ -92,6 +392,13 @@ sudo swapoff -a
 sudo sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab
 ```
 
+> **原理說明：** Kubernetes 的記憶體管理依賴 **cgroup**：當 Container 超過 `memory limit`，cgroup 觸發 OOM Kill（記憶體不足殺程式），確保 Pod 之間互不干擾。若開啟 Swap，超過 limit 的 Container 不會被立即殺死，而是把資料寫進 Swap，導致：
+> - 記憶體 limit 形同虛設，Pod 可能無限消耗資源
+> - 大量 Swap I/O 使節點效能劇降，但 Kubernetes 排程器不感知 Swap 使用量
+> - 節點假象「有記憶體」，Scheduler 仍排入更多 Pod，最終全部效能惡化
+>
+> `sed -i '/ swap / ...'` 將 `/etc/fstab` 中的 swap 條目註解掉，防止重啟後重新掛載。
+
 ### 2. 安裝必要工具
 
 ```bash
@@ -105,6 +412,10 @@ sudo apt-get install -y vim jq iputils-ping net-tools curl apt-transport-https c
 sudo ufw disable
 ```
 
+> **原理說明：** UFW（Uncomplicated Firewall）是 Ubuntu 的 iptables 前端。Kubernetes 本身透過 kube-proxy 動態管理大量 iptables / IPVS 規則（每個 Service 和 Endpoint 都有對應規則）。若 UFW 同時管理 iptables，兩者的規則可能衝突，導致 Service 路由失敗或 Pod 網路中斷。
+>
+> 正式環境中，應改用 Kubernetes 專用的防火牆策略（NetworkPolicy），而非依賴 OS 層 UFW。
+
 ### 4. 載入必要的核心模組
 
 ```bash
@@ -117,6 +428,18 @@ sudo modprobe overlay
 sudo modprobe br_netfilter
 ```
 
+> **原理說明：**
+>
+> **`overlay`（OverlayFS）：** containerd 使用 Overlay Filesystem 實作容器映像的分層儲存。一個 Container 的檔案系統由多個唯讀的映像層（lower layers）加上一個可寫層（upper layer）疊加而成。這讓多個 Container 可以共用相同的映像層，大幅節省磁碟空間：
+> ```
+> Container 寫入層（upper）      ← 每個 Container 獨立，程式的寫入在此
+>  +  nginx:alpine 映像層（lower）← 唯讀，多個 Container 共用
+>  +  alpine base 層（lower）    ← 唯讀，共用
+>  =  Container 看到的完整檔案系統
+> ```
+>
+> **`br_netfilter`（Bridge Netfilter）：** Linux bridge 預設只處理 Layer 2（MAC）流量，不經過 iptables（Layer 3/4）。但 kube-proxy 需要 iptables 規則來攔截流向 Service ClusterIP 的封包，進行 DNAT 轉發。載入 `br_netfilter` 後，bridge 上的流量也會通過 iptables，kube-proxy 才能正確攔截。
+
 ### 5. 設定核心參數
 
 ```bash
@@ -128,6 +451,14 @@ EOF
 
 sudo sysctl --system
 ```
+
+> **原理說明：**
+>
+> **`net.bridge.bridge-nf-call-iptables = 1`：** 啟用「bridge 上的 IPv4 流量通過 iptables」。即使載入了 `br_netfilter` 模組，還需要這個 sysctl 將功能開啟。沒有這個設定，Pod-to-Service 的流量無法被 kube-proxy 的 iptables 規則攔截，Service 存取失敗。
+>
+> **`net.ipv4.ip_forward = 1`：** 啟用 **IP 轉發**。節點作為路由器，需要能夠轉發不屬於自己的封包。例如從 Pod（10.244.x.x）送往另一個節點上的 Pod，封包需要經過節點的網路介面轉發出去。預設 Linux 不轉發，必須明確開啟。
+>
+> 這三個設定合在一起，才讓節點具備 Kubernetes 網路所需的封包轉發與 iptables 攔截能力。
 
 ### 6. 安裝 containerd
 
@@ -149,6 +480,27 @@ sudo sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/conf
 sudo systemctl restart containerd
 sudo systemctl enable containerd
 ```
+
+> **原理說明：**
+>
+> **為什麼要設定 `SystemdCgroup = true`？**
+>
+> **cgroup（Control Groups）** 是 Linux 核心用來限制和統計程式資源使用（CPU、Memory）的機制。管理 cgroup 有兩種方式（driver）：
+>
+> | Driver | 運作方式 | 適用場景 |
+> |--------|---------|---------|
+> | `cgroupfs` | 直接操作 `/sys/fs/cgroup` 目錄 | 非 systemd 環境 |
+> | `systemd` | 透過 systemd 的 cgroup 管理介面 | Ubuntu 22.04+ 建議 |
+>
+> **關鍵限制：** containerd 和 kubelet 必須使用相同的 cgroup driver。若 containerd 用 `cgroupfs` 但 kubelet 用 `systemd`（或反過來），kubelet 會報錯：
+> ```
+> Failed to start ContainerManager: Unit kubepods.slice already exists
+> ```
+> 並最終無法啟動。
+>
+> Ubuntu 22.04+ 使用 **cgroup v2** 並由 systemd 統一管理，因此設定 `SystemdCgroup = true` 讓 containerd 交由 systemd 管理 cgroup，與 kubelet 保持一致。
+>
+> **pause container（sandbox）是什麼？** containerd 啟動 Pod 時，會先建立一個特殊的 `pause` container（極小的映像，只是讓 process sleep）。這個 pause container 持有 Pod 的 **Network namespace** 和 **IPC namespace**。同一個 Pod 的所有應用 container 都加入這個 namespace，這就是為什麼同一 Pod 內的 container 可以用 `localhost` 互相通訊，且共享相同的 Pod IP。
 
 確認 containerd 運行正常：
 
@@ -172,6 +524,16 @@ echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] \
 
 sudo apt-get update
 ```
+
+> **原理說明 — 三個工具的職責差異：**
+>
+> | 工具 | 執行時機 | 職責 |
+> |------|---------|------|
+> | `kubeadm` | 安裝 / 升級時（一次性） | 引導叢集：產生憑證、建立 Static Pod manifest、產生 join token |
+> | `kubelet` | 永久執行（daemon） | 節點代理人：接收 Pod spec、呼叫 CRI 啟動容器、回報狀態 |
+> | `kubectl` | 使用者操作時 | CLI 工具：將使用者指令轉為 API Server 的 HTTP 請求 |
+>
+> **`apt-mark hold` 的用意：** 防止 `apt upgrade` 自動升級 Kubernetes 套件。Kubernetes 版本升級有嚴格的流程（需要依序升級 control plane → worker），不能讓套件管理員自動升版，否則版本不一致會導致叢集異常。
 
 查看可用版本：
 
@@ -226,6 +588,20 @@ sudo kubeadm init \
 - `--apiserver-advertise-address`：Master 節點的 IP，供 Worker 節點連線用
 - `--pod-network-cidr`：Pod 網路位址範圍（Flannel 預設使用 10.244.0.0/16）
 
+> **原理說明 — kubeadm init 做了什麼：**
+>
+> 1. **Preflight checks：** 檢查 swap 是否關閉、核心模組是否載入、container runtime 是否正常等
+> 2. **產生 PKI 憑證（`/etc/kubernetes/pki/`）：**
+>    - CA 憑證（`ca.crt`）：叢集根憑證，用來簽署所有其他憑證
+>    - API Server 憑證：包含所有節點 IP 和 DNS 名稱作為 SAN（Subject Alternative Name）
+>    - etcd 憑證：獨立的 CA 和客戶端憑證，確保 etcd 只接受 API Server 的連線
+>    - SA 金鑰對（`sa.key`/`sa.pub`）：用於簽署 ServiceAccount token
+> 3. **產生 kubeconfig 檔案（`/etc/kubernetes/*.conf`）：** 讓各元件知道如何連線 API Server
+> 4. **建立 Static Pod manifest（`/etc/kubernetes/manifests/`）：** kubelet 讀取這些 YAML 檔，啟動 etcd、kube-apiserver、kube-scheduler、kube-controller-manager
+> 5. **等待 Control Plane 就緒**
+> 6. **將叢集設定寫入 etcd（ConfigMap `kubeadm-config`）**
+> 7. **建立 bootstrap token：** Worker 節點加入時使用，有效期 24 小時
+
 ### 3. 設定 kubectl 存取
 
 ```bash
@@ -233,6 +609,13 @@ mkdir -p $HOME/.kube
 sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
 sudo chown $(id -u):$(id -g) $HOME/.kube/config
 ```
+
+> **原理說明：** `admin.conf` 是 kubeconfig 格式的檔案，包含三項資訊：
+> - **cluster**：API Server 的位址與 CA 憑證（用來驗證 Server 身份）
+> - **credentials**：使用者的客戶端憑證與私鑰（用來向 API Server 證明身份）
+> - **context**：將 cluster 與 credentials 組合起來，並指定預設 namespace
+>
+> `kubectl` 讀取 `~/.kube/config`（或 `$KUBECONFIG` 環境變數指定的路徑），從中取得連線資訊。`admin.conf` 內建 `kubernetes-admin` 身份，擁有 `cluster-admin` ClusterRole（最高權限）。
 
 若以 root 登入：
 
@@ -250,6 +633,26 @@ echo "source <(kubectl completion bash)" >> ~/.bashrc
 ---
 
 ## 三、部署 Pod 網路（Flannel）
+
+> **原理說明 — 為什麼需要 CNI？**
+>
+> `kubeadm init` 完成後，節點狀態是 `NotReady`，原因是缺少 **CNI（Container Network Interface）插件**。CNI 負責：
+> 1. 為每個 Pod 分配唯一 IP（從 `--pod-network-cidr` 範圍內）
+> 2. 設定 Pod 的 network namespace 和路由
+> 3. 實現跨節點的 Pod-to-Pod 通訊
+>
+> 在安裝 CNI 之前，CoreDNS Pod 也會卡在 `Pending`，因為它本身是 Pod，需要 CNI 才能取得 IP。
+>
+> **Flannel vs 其他 CNI：**
+>
+> | CNI | 特色 | 適用場景 |
+> |-----|------|---------|
+> | Flannel | 簡單、輕量、VXLAN 封裝 | 學習、小型叢集 |
+> | Calico | 支援 NetworkPolicy、BGP 路由 | 生產環境 |
+> | Cilium | eBPF 加速、深度可觀測性 | 高效能、安全需求高 |
+> | Weave | 加密傳輸 | 安全需求較高 |
+>
+> Flannel **不支援** NetworkPolicy（建立物件不報錯但不生效）。若需要 NetworkPolicy 強制執行，需換用 Calico 或 Cilium。
 
 ### 1. 下載 Flannel 設定檔
 
@@ -284,6 +687,14 @@ net-conf.json: |
   - --iface=enp0s8
 ```
 
+> **原理說明 — 為什麼要指定 `--iface`？**
+>
+> 在 VirtualBox / 多網卡環境中，節點通常有兩張網卡：
+> - `eth0`（NAT，對外上網，但節點間無法互通）
+> - `eth1`（Host-only，節點間私有網路 192.168.56.x）
+>
+> Flannel 預設使用**預設路由的網卡**（通常是 `eth0`/NAT），但 NAT 網路上各節點的 IP 是相同的（10.0.2.15），導致 Flannel 無法區分不同節點。指定 `--iface=eth1` 讓 Flannel 使用 Host-only 介面，才能正確識別節點並建立 VXLAN tunnel。
+
 > **注意：** Ubuntu 24.04 的網路介面名稱可能有所不同，請執行 `ip link` 確認後填入正確介面名稱。
 
 ### 3. 套用 Flannel
@@ -314,6 +725,24 @@ sudo kubeadm join 192.168.56.10:6443 \
   --token <token> \
   --discovery-token-ca-cert-hash sha256:<hash>
 ```
+
+> **原理說明 — kubeadm join 的安全機制：**
+>
+> Worker 加入叢集需要解決兩個安全問題：「Worker 怎麼知道連的是合法的 API Server」和「API Server 怎麼知道是合法的 Worker」：
+>
+> 1. **`--discovery-token-ca-cert-hash`（雙向驗證的第一步）：**
+>    Worker 連上 API Server 後，取得 API Server 的 CA 憑證，計算其 SHA256 雜湊值，與這個參數比對。若相符，確認連到的是合法叢集（防止 Worker 被重導向到惡意 API Server）。
+>
+> 2. **`--token`（身份憑證）：**
+>    Bootstrap Token 是一個短期憑證（預設 24 小時），Worker 用它向 API Server 證明自己有加入叢集的授權。API Server 驗證 token 後，為該節點的 kubelet 核發長期客戶端憑證（TLS Bootstrap 流程）。
+>
+> 3. **TLS Bootstrap 流程（加入後）：**
+>    ```
+>    kubelet 用 bootstrap token → 送出 CSR（Certificate Signing Request）
+>    → kube-controller-manager 自動核准（auto-approver）
+>    → kubelet 取得長期客戶端憑證
+>    → 後續通訊用此憑證，不再需要 bootstrap token
+>    ```
 
 ### 2. 若忘記 Join 指令
 
