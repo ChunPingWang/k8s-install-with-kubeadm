@@ -1462,6 +1462,784 @@ kubectl logs -n kube-flannel -l app=flannel --tail=50
 
 ---
 
+# 存儲原理深度說明
+
+本章從 Linux 磁碟掛載出發，逐層建立「為什麼 Kubernetes 存儲這樣設計」的完整認識。
+
+---
+
+## 一、基礎概念：Volume 是什麼？
+
+### 1.1 容器存儲的根本問題
+
+容器的檔案系統是**臨時的（Ephemeral）**。容器一旦重啟，所有寫入都消失。這帶來三個問題：
+
+```
+問題 1：資料持久性
+  Pod 重啟 → rootfs 重置 → 資料遺失
+
+問題 2：容器間共享
+  同一 Pod 內 app + log-agent 兩個 container
+  → 各自有獨立 rootfs → 無法直接共享 /log/
+
+問題 3：設定注入
+  映像 build 時不應寫死設定
+  → ConfigMap / Secret 需要「掛入」容器
+```
+
+Kubernetes **Volume** 解決了這三個問題：Volume 的生命週期與 **Pod** 綁定（而非 container），Pod 內所有 container 可共享同一 Volume。
+
+### 1.2 Volume 與 Linux mount 的關係
+
+Kubernetes Volume 本質上就是 Linux **bind mount**：
+
+```
+主機目錄或設備   ──bind mount──►  容器內路徑
+/var/lib/kubelet/pods/<uid>/volumes/...   →  /data
+```
+
+kubelet 負責在 Pod 啟動前完成 mount，在 Pod 刪除後執行 unmount。整個流程：
+
+```
+1. kubelet 收到 Pod spec
+2. 準備 Volume（建立目錄、掛載 NFS、attach 雲端磁碟...）
+3. 呼叫 containerd 建立 container
+4. containerd 透過 OCI spec 將 Volume 路徑 bind mount 進 container
+5. Pod 刪除 → container 停止 → kubelet unmount Volume
+```
+
+---
+
+## 二、Volume 類型全覽
+
+### 2.1 臨時 Volume（Pod 生命週期）
+
+#### emptyDir
+
+Pod 啟動時建立的**空目錄**，Pod 內所有 container 可共享，Pod 刪除後資料消失。
+
+```yaml
+volumes:
+- name: shared-log
+  emptyDir: {}          # 預設存在 node 的磁碟上
+  # emptyDir:
+  #   medium: Memory    # 改存在 tmpfs（RAM），更快但佔記憶體
+  #   sizeLimit: 500Mi  # 限制大小
+```
+
+**典型用途：**
+- Sidecar 模式：app container 寫 `/log/`，log-agent container 讀同一目錄
+- 多階段計算：stage1 寫結果，stage2 讀取處理
+- 暫存快取（medium: Memory 加速）
+
+```
+Pod
+├── container: app      ─┐
+│     mountPath: /log/   │  共享 emptyDir
+└── container: log-agent─┘
+      mountPath: /log/
+```
+
+#### 與 hostPath 的本質差異
+
+| | emptyDir | hostPath |
+|---|---|---|
+| 生命週期 | 隨 Pod | 隨 Node（Pod 刪除資料仍在） |
+| 跨 Node | 不同 Node 有不同資料 | 同上 |
+| 安全性 | 安全 | 高風險（可讀 host 敏感檔案） |
+
+### 2.2 Node 本地 Volume
+
+#### hostPath
+
+直接掛載**宿主機目錄或檔案**進容器。
+
+```yaml
+volumes:
+- name: host-docker-sock
+  hostPath:
+    path: /var/run/docker.sock
+    type: Socket          # 必須是 Socket 類型
+```
+
+**type 選項說明：**
+
+| type | 行為 |
+|---|---|
+| `""` | 不做任何預檢 |
+| `Directory` | 目錄必須已存在 |
+| `DirectoryOrCreate` | 不存在則自動建立 |
+| `File` | 檔案必須已存在 |
+| `FileOrCreate` | 不存在則自動建立 |
+| `Socket` | Unix socket 必須已存在 |
+| `BlockDevice` | 區塊設備必須已存在 |
+
+**安全風險：** hostPath 可存取 `/etc/`, `/var/lib/kubelet/` 等敏感路徑，CKS 試題中 hostPath 是常見的安全審查對象。生產環境應避免使用，或搭配 PSA 的 `restricted` policy 禁止。
+
+#### local（靜態供應的 Local Volume）
+
+比 hostPath 更正式，與 PV 系統整合，支援 node affinity：
+
+```yaml
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: local-pv
+spec:
+  capacity:
+    storage: 100Gi
+  accessModes: [ReadWriteOnce]
+  persistentVolumeReclaimPolicy: Delete
+  storageClassName: local-storage
+  local:
+    path: /mnt/data
+  nodeAffinity:                      # ← 關鍵：強制 Pod 排程到同一 Node
+    required:
+      nodeSelectorTerms:
+      - matchExpressions:
+        - key: kubernetes.io/hostname
+          operator: In
+          values: [k8s-worker1]
+```
+
+### 2.3 網路 Volume（跨 Node 存取）
+
+#### NFS
+
+最簡單的網路共享存儲：
+
+```yaml
+volumes:
+- name: nfs-vol
+  nfs:
+    server: 192.168.56.100    # NFS server IP
+    path: /exports/data
+    readOnly: false
+```
+
+NFS Volume 的特性：
+- 多個 Pod 同時讀寫（支援 ReadWriteMany）
+- 不需要 CSI 驅動，kubelet 直接掛載
+- 效能受網路延遲影響
+
+#### ConfigMap / Secret as Volume
+
+ConfigMap 和 Secret 也是 Volume 的一種，每個 key 對應容器內的一個**檔案**：
+
+```yaml
+volumes:
+- name: app-config
+  configMap:
+    name: my-config
+    items:                    # 可選：只掛載特定 key
+    - key: app.properties
+      path: app.properties    # 容器內檔案名
+      mode: 0444              # 檔案權限
+```
+
+```
+ConfigMap: my-config
+  key: app.properties  →  /etc/config/app.properties
+  key: log.conf        →  /etc/config/log.conf
+```
+
+**重要行為：**
+- Volume 掛載的 ConfigMap **會自動同步**（約 1 分鐘）
+- 環境變數注入的 ConfigMap **不會自動更新**（需重啟 Pod）
+- Secret Volume 掛載後儲存在 **tmpfs**（記憶體），不寫磁碟
+
+---
+
+## 三、PersistentVolume 系統
+
+### 3.1 設計動機：解耦存儲供應與消費
+
+直接在 Pod spec 中寫 NFS server IP 有幾個問題：
+1. 開發者需要知道基礎設施細節（IP、路徑）
+2. 存儲配置散落在各 Pod spec 中，難以統一管理
+3. 無法做容量控管
+
+Kubernetes 引入 **PV / PVC** 兩層抽象：
+
+```
+管理員視角                     開發者視角
+┌─────────────────┐           ┌──────────────────┐
+│ PersistentVolume│           │PersistentVolume   │
+│ (PV)            │◄──Bind────│Claim (PVC)        │
+│                 │           │                  │
+│ 實際存儲資源     │           │「我要 10Gi RWO」  │
+│ NFS/Cloud Disk  │           │不關心底層是什麼   │
+└─────────────────┘           └──────────────────┘
+         ▲                              ▲
+    管理員建立                     開發者建立
+    或 StorageClass               在 Pod 中引用
+    動態供應
+```
+
+### 3.2 PV 完整規格解析
+
+```yaml
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: pv-example
+spec:
+  capacity:
+    storage: 10Gi              # 容量宣告
+  accessModes:
+  - ReadWriteOnce              # 存取模式（見下方說明）
+  persistentVolumeReclaimPolicy: Retain  # 回收策略
+  storageClassName: standard   # StorageClass 名稱
+  mountOptions:                # 掛載選項（傳給 mount 指令）
+  - hard
+  - nfsvers=4.1
+  nfs:                         # 後端存儲類型
+    server: 192.168.56.100
+    path: /exports/pv-example
+```
+
+### 3.3 AccessMode（存取模式）深度說明
+
+存取模式描述的是**同時**可以有多少 Node 掛載此 Volume：
+
+| AccessMode | 縮寫 | 含義 |
+|---|---|---|
+| `ReadWriteOnce` | RWO | 只能被**一個 Node** 以讀寫方式掛載 |
+| `ReadOnlyMany` | ROX | 可以被**多個 Node** 以唯讀方式掛載 |
+| `ReadWriteMany` | RWX | 可以被**多個 Node** 以讀寫方式掛載 |
+| `ReadWriteOncePod` | RWOP | 只能被**一個 Pod** 以讀寫方式掛載（v1.22+） |
+
+**關鍵誤解澄清：** RWO 是 **Node** 層級，不是 Pod 層級。同一個 Node 上的多個 Pod 都可以掛載同一個 RWO PV。RWOP 才是真正的單 Pod 獨佔。
+
+```
+RWO 誤解圖：
+  Node A
+  ├── Pod-1 ──┐
+  └── Pod-2 ──┴── PV (RWO) ← 合法！同一 Node 的兩個 Pod
+
+  Node A ──── PV (RWO)  ← 合法
+  Node B ──── PV (RWO)  ← 不合法！RWO 只允許一個 Node
+```
+
+**後端存儲對 AccessMode 的支援（常考）：**
+
+| 存儲類型 | RWO | ROX | RWX |
+|---|---|---|---|
+| hostPath | ✅ | ❌ | ❌ |
+| NFS | ✅ | ✅ | ✅ |
+| AWS EBS | ✅ | ❌ | ❌ |
+| GCE PD | ✅ | ✅ | ❌ |
+| Azure Disk | ✅ | ❌ | ❌ |
+| CephFS | ✅ | ✅ | ✅ |
+
+### 3.4 ReclaimPolicy（回收策略）
+
+PVC 刪除後，PV 如何處理？
+
+#### Retain（保留）
+
+```
+PVC 刪除
+  → PV 狀態變為 Released（不可被新 PVC 綁定）
+  → 管理員需手動介入：
+      1. 備份或確認資料
+      2. 刪除 PV（資料留在後端）
+      3. 重新建立 PV 供再次使用
+  → 後端存儲（NFS 目錄、雲端磁碟）資料不自動刪除
+```
+
+#### Delete
+
+```
+PVC 刪除
+  → PV 狀態變為 Terminating
+  → Kubernetes 自動刪除 PV 物件
+  → 後端存儲也一起刪除（例：AWS EBS volume 被 delete）
+  → 資料永久消失！
+```
+
+#### 狀態機
+
+```
+PV 完整生命週期：
+
+Available ──(PVC binding)──► Bound ──(PVC delete, Retain)──► Released
+    ▲                                                             │
+    └──────────── 手動清理 claimRef 後重新 Available ◄────────────┘
+
+Available ──(PVC binding)──► Bound ──(PVC delete, Delete)──► [PV 消失]
+```
+
+### 3.5 PVC 綁定規則
+
+PVC 尋找 PV 時，必須**同時**滿足：
+
+```
+1. capacity：PV 容量 ≥ PVC 申請量
+2. accessModes：PV 支援 PVC 要求的所有模式
+3. storageClassName：完全相符（包含空字串）
+4. volumeMode：Filesystem 或 Block 一致
+5. selector（可選）：PVC 可用 label selector 指定 PV
+```
+
+**綁定是「最小滿足」但不保證最小浪費：**
+
+```
+現有 PV：10Gi, 50Gi, 100Gi
+PVC 申請：8Gi
+
+→ 系統會綁定 10Gi 的 PV（最小滿足）
+→ 但若只有 50Gi 和 100Gi，會綁 50Gi（浪費 42Gi）
+→ 不會因浪費而拒絕綁定
+```
+
+---
+
+## 四、StorageClass 與動態供應
+
+### 4.1 靜態供應 vs 動態供應
+
+```
+靜態供應（Static Provisioning）：
+  管理員 → 手動建立 PV → 開發者建立 PVC → 自動綁定
+
+動態供應（Dynamic Provisioning）：
+  管理員 → 建立 StorageClass → 開發者建立 PVC → 自動建立 PV + 綁定
+                                                        ↑
+                                               StorageClass 中的
+                                               Provisioner 負責
+```
+
+### 4.2 StorageClass 規格
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: fast-ssd
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"  # 設為預設 SC
+provisioner: kubernetes.io/aws-ebs          # 哪個 Provisioner 處理
+parameters:                                  # 傳給 Provisioner 的參數
+  type: gp3
+  iopsPerGB: "50"
+  encrypted: "true"
+reclaimPolicy: Delete                        # 動態建立的 PV 的回收策略
+allowVolumeExpansion: true                   # 允許擴容 PVC
+volumeBindingMode: WaitForFirstConsumer      # 見下方說明
+mountOptions:
+- debug
+```
+
+### 4.3 volumeBindingMode 關鍵差異
+
+| 模式 | 行為 | 適用場景 |
+|---|---|---|
+| `Immediate` | PVC 建立後**立即**尋找/建立 PV | NFS、Ceph 等共享存儲 |
+| `WaitForFirstConsumer` | 等到 Pod 被**排程到 Node** 後才供應 PV | Local Volume、CSI 拓撲感知 |
+
+**為什麼需要 WaitForFirstConsumer？**
+
+```
+問題場景（Immediate 模式 + Local Volume）：
+  PVC 建立 → 立即在 Node A 建立 PV
+  Pod 因 Node Affinity 只能去 Node B
+  → Pod 永遠 Pending！（PV 在 Node A，Pod 要去 Node B）
+
+解法（WaitForFirstConsumer）：
+  PVC 建立 → 等待
+  Pod 排程器決定 Pod 去 Node B
+  → 在 Node B 建立 PV
+  → Pod 和 PV 在同一 Node → 正常運行
+```
+
+### 4.4 Default StorageClass
+
+若 PVC **不指定** `storageClassName`，且叢集有預設 StorageClass，會自動使用預設 SC 動態供應：
+
+```bash
+# 查看預設 StorageClass（有 (default) 標記）
+kubectl get sc
+# NAME                 PROVISIONER             RECLAIMPOLICY   VOLUMEBINDINGMODE
+# standard (default)   rancher.io/local-path   Delete          WaitForFirstConsumer
+```
+
+若 PVC 明確設 `storageClassName: ""`，代表**不使用** StorageClass，只綁定靜態 PV。
+
+---
+
+## 五、CSI 架構原理
+
+### 5.1 為什麼需要 CSI？
+
+Kubernetes 早期將存儲驅動（如 AWS EBS、GCE PD）直接編譯進 kubelet（In-tree 插件）。問題：
+- 更新存儲驅動 → 必須升級整個 Kubernetes
+- 第三方廠商無法獨立釋出驅動
+- Bug 修復週期與 K8s release 耦合
+
+**CSI（Container Storage Interface）** 將存儲驅動從 K8s core 中分離：
+
+```
+舊架構（In-tree）：
+  kubelet ──直接呼叫──► AWS EBS API
+           ──直接呼叫──► GCE PD API
+           ──直接呼叫──► ...（編譯在一起）
+
+新架構（CSI）：
+  kubelet ──gRPC──► CSI Node Plugin（DaemonSet，每個 Node 一個）
+                         │
+                         └──► 存儲後端（AWS EBS / Ceph / NFS...）
+
+  Controller Manager ──gRPC──► CSI Controller Plugin（Deployment）
+                                    │
+                                    └──► 建立/刪除後端 Volume
+```
+
+### 5.2 CSI 組件架構圖
+
+```
+Control Plane
+┌─────────────────────────────────────────────────────┐
+│  kube-controller-manager                            │
+│    AttachDetachController  ──────────────────────┐  │
+│    PVController (動態供應)  ──────────────────┐   │  │
+└─────────────────────────────────────────────── │ ──│─┘
+                                                 │   │
+                            ┌────────────────────▼───▼──┐
+                            │  CSI Controller Plugin    │
+                            │  (Deployment, 1~3 replicas)│
+                            │  - CreateVolume           │
+                            │  - DeleteVolume           │
+                            │  - ControllerPublish      │
+                            │    (attach to Node)       │
+                            └───────────────────────────┘
+
+Worker Node
+┌─────────────────────────────────────────────────────┐
+│  kubelet                                            │
+│    VolumeManager  ────────────────────────────────┐ │
+└────────────────────────────────────────────────── │ ┘
+                                                    │
+                        ┌───────────────────────────▼──┐
+                        │  CSI Node Plugin             │
+                        │  (DaemonSet，每個 Node 一個)  │
+                        │  - NodeStageVolume           │
+                        │    (global mount)            │
+                        │  - NodePublishVolume         │
+                        │    (bind mount to Pod)       │
+                        └──────────────────────────────┘
+```
+
+### 5.3 CSI Volume 生命週期（以動態供應為例）
+
+```
+開發者建立 PVC
+    │
+    ▼
+PVController 呼叫 CSI Controller Plugin
+    │  CreateVolume → 在後端建立真實磁碟（如 AWS EBS）
+    │  回傳 volumeID
+    ▼
+PV 物件自動建立，PVC 狀態變 Bound
+    │
+    ▼
+Pod 被排程到 Node X
+    │
+    ▼
+AttachDetachController 呼叫 CSI Controller Plugin
+    │  ControllerPublishVolume → 將磁碟 attach 到 Node X
+    ▼
+kubelet 的 VolumeManager 呼叫 CSI Node Plugin
+    │  NodeStageVolume → 格式化並掛載到 Node 的 staging 目錄
+    │    /var/lib/kubelet/plugins/kubernetes.io/csi/pv/<pv-name>/globalmount
+    │  NodePublishVolume → bind mount 到 Pod 的 Volume 路徑
+    │    /var/lib/kubelet/pods/<pod-uid>/volumes/kubernetes.io~csi/<pv-name>/mount
+    ▼
+容器啟動，/data 可用
+```
+
+### 5.4 常見 CSI 驅動
+
+| 驅動 | 提供者 | 支援 AccessMode |
+|---|---|---|
+| `ebs.csi.aws.com` | AWS | RWO |
+| `pd.csi.storage.gke.io` | GKE | RWO, ROX |
+| `disk.csi.azure.com` | Azure | RWO |
+| `file.csi.azure.com` | Azure Files | RWO, ROX, RWX |
+| `rbd.csi.ceph.com` | Ceph RBD | RWO, ROX |
+| `cephfs.csi.ceph.com` | CephFS | RWO, ROX, RWX |
+| `nfs.csi.k8s.io` | community NFS | RWO, ROX, RWX |
+
+---
+
+## 六、StatefulSet 與存儲
+
+### 6.1 StatefulSet 為什麼需要特殊存儲處理？
+
+Deployment 中的 Pod 是**無狀態的、可互換的**，所有 Pod 共享同一個 PVC 沒有問題（若後端支援 RWX）。
+
+但 StatefulSet 的 Pod 是**有身份的**：
+- `mysql-0`, `mysql-1`, `mysql-2` 各自代表不同的資料庫實例
+- 每個 Pod 需要自己**獨立的** PVC（各自的存儲空間）
+- Pod 重建後必須掛載**相同的** PVC（資料不能錯位）
+
+### 6.2 volumeClaimTemplate
+
+StatefulSet 透過 `volumeClaimTemplates` 為每個 Pod **自動建立獨立 PVC**：
+
+```yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mysql
+spec:
+  serviceName: mysql-headless
+  replicas: 3
+  selector:
+    matchLabels:
+      app: mysql
+  template:
+    spec:
+      containers:
+      - name: mysql
+        image: mysql:8.0
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/mysql
+  volumeClaimTemplates:          # ← 模板，不是直接的 PVC
+  - metadata:
+      name: data
+    spec:
+      accessModes: [ReadWriteOnce]
+      storageClassName: fast-ssd
+      resources:
+        requests:
+          storage: 20Gi
+```
+
+自動建立的 PVC 命名規則：`<template-name>-<statefulset-name>-<ordinal>`
+
+```
+StatefulSet: mysql, replicas: 3
+→ 自動建立：
+  data-mysql-0  (20Gi, RWO)
+  data-mysql-1  (20Gi, RWO)
+  data-mysql-2  (20Gi, RWO)
+
+mysql-0 重建 → 自動掛回 data-mysql-0（不會誤掛 data-mysql-1）
+```
+
+### 6.3 StatefulSet 縮容與 PVC 的行為
+
+**StatefulSet 縮容時，PVC 不會自動刪除：**
+
+```bash
+# 縮容從 3 到 1
+kubectl scale statefulset mysql --replicas=1
+# → mysql-1, mysql-2 Pod 被刪除
+# → data-mysql-1, data-mysql-2 PVC 仍然存在！
+
+# 再擴容到 3
+kubectl scale statefulset mysql --replicas=3
+# → mysql-1, mysql-2 重建，自動掛回原來的 PVC（資料完整保留）
+```
+
+設計原則：StatefulSet **刻意**保留 PVC，防止意外縮容導致資料遺失。若確認要刪除，需手動刪除 PVC。
+
+---
+
+## 七、Volume 安全性與進階特性
+
+### 7.1 fsGroup 與 Volume 權限
+
+容器預設以 `runAsUser` 指定的 UID 執行，但 Volume 目錄的 owner 可能是 root，導致無法寫入：
+
+```yaml
+spec:
+  securityContext:
+    runAsUser: 1000
+    runAsGroup: 3000
+    fsGroup: 2000          # ← Volume 目錄的 GID 會被設為 2000
+                           #   且 Pod 內的 process 會有 supplementary group 2000
+  containers:
+  - name: app
+    volumeMounts:
+    - name: data
+      mountPath: /data
+```
+
+```
+kubelet 掛載 Volume 後執行：
+  chown :2000 /data       （GID 改為 fsGroup）
+  chmod g+rw /data        （群組可讀寫）
+
+容器內 process（UID=1000, GID=3000, supplementary=2000）
+  → 有 GID 2000 → 可以讀寫 /data
+```
+
+### 7.2 readOnlyRootFilesystem 與 Volume
+
+CKS 常考：`readOnlyRootFilesystem: true` 使根檔案系統唯讀，但容器往往需要寫入暫存目錄：
+
+```yaml
+containers:
+- name: app
+  securityContext:
+    readOnlyRootFilesystem: true
+  volumeMounts:
+  - name: tmp
+    mountPath: /tmp          # 應用程式需要寫 /tmp
+  - name: var-run
+    mountPath: /var/run      # 需要 PID file
+volumes:
+- name: tmp
+  emptyDir: {}               # 用 emptyDir 提供可寫路徑
+- name: var-run
+  emptyDir: {}
+```
+
+### 7.3 subPath — 共享 Volume 中的子目錄
+
+多個 container 共享同一 PVC 但各自使用不同子目錄：
+
+```yaml
+containers:
+- name: app1
+  volumeMounts:
+  - name: shared
+    mountPath: /data
+    subPath: app1             # 實際掛載 PV 內的 app1/ 子目錄
+- name: app2
+  volumeMounts:
+  - name: shared
+    mountPath: /data
+    subPath: app2             # 實際掛載 PV 內的 app2/ 子目錄
+volumes:
+- name: shared
+  persistentVolumeClaim:
+    claimName: shared-pvc
+```
+
+```
+PV 目錄結構：
+/
+├── app1/   ← app1 container 的 /data
+└── app2/   ← app2 container 的 /data
+```
+
+**注意：** 使用 `subPath` 時，ConfigMap/Secret 的自動更新**不生效**（K8s 已知限制）。
+
+### 7.4 Volume 擴容（Volume Expansion）
+
+前提：StorageClass 設定 `allowVolumeExpansion: true`，且後端支援線上擴容。
+
+```bash
+# 直接編輯 PVC 的 storage 大小（只能增加，不能縮小）
+kubectl patch pvc my-pvc -p '{"spec":{"resources":{"requests":{"storage":"20Gi"}}}}'
+
+# 觀察擴容狀態
+kubectl describe pvc my-pvc
+# Conditions:
+#   FileSystemResizePending  → 正在擴容（Pod 需要 restart 才能看到新空間，視後端而定）
+#   Resizing                 → 後端磁碟正在擴容
+```
+
+---
+
+## 八、存儲問題排查指引
+
+### 8.1 診斷流程
+
+```
+Pod 狀態：Pending
+    │
+    ▼
+kubectl describe pod <name>
+    │
+    ├── "persistentvolumeclaim ... not found"
+    │     → PVC 名稱拼錯，或在不同 namespace
+    │
+    ├── "no persistent volumes available for this claim"
+    │     → 找不到符合條件的 PV（容量/accessMode/storageClass 不符）
+    │
+    ├── "waiting for a volume to be created"
+    │     → StorageClass 動態供應等待中，或 Provisioner 有問題
+    │
+    └── "volume ... is already exclusively attached to one node"
+          → RWO 的 Volume 已 attach 到另一個 Node（常見於 Node 故障後的 Pod 遷移）
+```
+
+### 8.2 常見問題與解法
+
+| 症狀 | 根本原因 | 解法 |
+|---|---|---|
+| PVC 一直 Pending | 無符合的 PV | 檢查 PV capacity/accessMode/storageClass |
+| PV 狀態 Released（無法再綁定） | ReclaimPolicy=Retain，舊 PVC 刪除 | 手動刪除 PV 的 `claimRef` 欄位 |
+| Pod Pending：volume node affinity conflict | PV 建立在錯誤的 Node | 確認 SC 使用 WaitForFirstConsumer |
+| 容器無法寫入 Volume | UID/GID 權限問題 | 設定 `securityContext.fsGroup` |
+| StatefulSet 擴容後 PVC 無法建立 | StorageClass 不存在或 Provisioner 故障 | 檢查 `kubectl get sc` 和 Provisioner Pod |
+| ConfigMap Volume 更新不生效 | 使用了 `subPath` | 改用完整 mountPath，或手動重啟 Pod |
+
+### 8.3 實用排查指令
+
+```bash
+# 查看 PV 和 PVC 的綁定狀態
+kubectl get pv,pvc -A
+
+# 查看 PV 詳細資訊（含 claimRef）
+kubectl describe pv <pv-name>
+
+# 查看 StorageClass
+kubectl get sc
+
+# 查看 PVC 的事件（排查供應失敗）
+kubectl describe pvc <pvc-name> -n <namespace>
+
+# 查看 CSI 節點驅動狀態
+kubectl get csinodes
+kubectl get csidrivers
+
+# 查看 kubelet 的 Volume 掛載（在 Node 上執行）
+ls /var/lib/kubelet/pods/
+mount | grep kubernetes
+
+# 檢查 PV 是否有孤兒 claimRef（Released 狀態無法重用）
+kubectl get pv -o json | jq '.items[] | select(.status.phase=="Released") | {name:.metadata.name, claim:.spec.claimRef}'
+```
+
+---
+
+## 存儲知識結構總結
+
+```
+存儲架構全景：
+
+應用層（開發者）
+  PVC ──────────────────────────────────────────────────────► Pod Volume Mount
+   │                                                              │
+   │ 綁定                                                         │ bind mount
+   ▼                                                              ▼
+  PV ◄──────── StorageClass（動態）  Container rootfs (/data)
+   │              │  Provisioner              │
+   │              ▼                           │
+   │         CSI Controller Plugin        emptyDir / hostPath
+   │              │                      ConfigMap / Secret
+   ▼              ▼
+後端存儲（NFS / AWS EBS / Ceph / Local Disk）
+
+關鍵設計原則：
+  ┌────────────────────────────────────────────────────┐
+  │ 1. Volume 生命週期與 Pod 綁定，PV 生命週期獨立      │
+  │ 2. PVC 是「存儲申請」，PV 是「存儲資源」            │
+  │ 3. StorageClass 抽象後端差異，Provisioner 動態供應  │
+  │ 4. AccessMode 是 Node 層級（除 RWOP 是 Pod 層級）   │
+  │ 5. StatefulSet 的 PVC 縮容後保留（防資料遺失）      │
+  │ 6. CSI 將存儲驅動從 K8s core 解耦（DaemonSet+Deploy）│
+  └────────────────────────────────────────────────────┘
+```
+
+---
+
 ## CKA 題目
 
 ### CKA-Q1：查看叢集狀態與節點資訊
