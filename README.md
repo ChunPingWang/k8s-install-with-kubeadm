@@ -2240,6 +2240,804 @@ kubectl get pv -o json | jq '.items[] | select(.status.phase=="Released") | {nam
 
 ---
 
+# 身份識別與存取控制原理
+
+本章說明 Kubernetes 如何識別「你是誰」（認證）、「你能做什麼」（RBAC 授權），以及 ServiceAccount 如何讓 Pod 安全地與 API Server 互動。
+
+---
+
+## 一、請求進入 API Server 的完整流程
+
+每一個對 Kubernetes API 的請求，都要經過三道關卡：
+
+```
+kubectl / Pod / Controller
+        │
+        │ HTTPS 請求
+        ▼
+┌─────────────────────────────────────────────────────────┐
+│                    kube-apiserver                       │
+│                                                         │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  │
+│  │ 1. 認證       │→ │ 2. 授權       │→ │ 3. 准入控制   │  │
+│  │ Authentication│  │ Authorization│  │  Admission   │  │
+│  │               │  │  (RBAC)      │  │  Controller  │  │
+│  │ 你是誰？      │  │ 你能做什麼？  │  │ 合規嗎？     │  │
+│  └──────────────┘  └──────────────┘  └──────────────┘  │
+│         │                │                  │           │
+│      401 Unauthorized  403 Forbidden     400/422        │
+└─────────────────────────────────────────────────────────┘
+        │（三關都過）
+        ▼
+    etcd 讀寫 / 物件處理
+```
+
+### 1.1 認證（Authentication）
+
+API Server 支援多種認證方式，同時啟用，任一通過即算認證成功：
+
+| 認證方式 | 典型用途 | 識別結果 |
+|---|---|---|
+| X.509 用戶端憑證 | `kubectl`（admin.conf）、kubelets | `CN=system:node:k8s-worker1` |
+| Bearer Token（JWT） | ServiceAccount Pod | `system:serviceaccount:default:my-sa` |
+| Bootstrap Token | kubeadm join 時 | `system:bootstrap:<token-id>` |
+| OIDC Token | 整合外部 IdP（如 Dex、Keycloak） | 由 IdP 提供 username/groups |
+| Static Token File | 測試用（不推薦生產） | 設定檔指定 |
+
+認證後，API Server 得到兩個關鍵屬性：
+- **Username**（如 `kubernetes-admin`、`system:serviceaccount:default:my-sa`）
+- **Groups**（如 `system:masters`、`system:authenticated`）
+
+### 1.2 認證失敗 vs 授權失敗的差別
+
+```bash
+# 認證失敗（401）：API Server 不認識你
+curl -k https://192.168.56.10:6443/api/v1/pods
+# {"message":"Unauthorized"}
+
+# 認證成功但授權失敗（403）：知道你是誰，但你沒有權限
+kubectl auth can-i delete pods --as=system:serviceaccount:default:my-sa
+# no
+```
+
+---
+
+## 二、RBAC 模型深度說明
+
+### 2.1 核心三要素
+
+RBAC（Role-Based Access Control）的本質是一張**三維映射表**：
+
+```
+Subject（誰）× Verb（做什麼）× Resource（對什麼）→ 允許 / 拒絕
+```
+
+```
+Subject 種類：
+  User        → kubectl 使用者（X.509 CN，K8s 不管理 User 物件）
+  Group       → 使用者群組（X.509 O，或 OIDC groups claim）
+  ServiceAccount → Pod 的身份
+
+Verb 種類：
+  get, list, watch          → 讀取
+  create, update, patch     → 寫入
+  delete, deletecollection  → 刪除
+  use, bind, escalate       → 特殊（PSP、Role 相關）
+  *                         → 所有操作
+
+Resource 種類：
+  pods, deployments, services, secrets...
+  pods/log, pods/exec, pods/portforward   ← subresource（斜線分隔）
+  *                                        ← 所有資源
+```
+
+### 2.2 Role vs ClusterRole：作用域差異
+
+```
+Role（namespace 範圍）          ClusterRole（叢集範圍）
+┌─────────────────────┐        ┌──────────────────────────┐
+│  namespace: dev     │        │  叢集所有 namespace       │
+│  ┌───────────────┐  │        │  ┌────────────────────┐  │
+│  │ Role          │  │        │  │ ClusterRole        │  │
+│  │ pod-reader    │  │        │  │ cluster-admin      │  │
+│  │ get,list pods │  │        │  │ * on *             │  │
+│  └───────────────┘  │        │  └────────────────────┘  │
+└─────────────────────┘        └──────────────────────────┘
+
+RoleBinding 可以綁定：          ClusterRoleBinding 只能綁定：
+  Role（同 namespace）            ClusterRole
+  ClusterRole（降級為 namespace 範圍使用）
+
+⚠️ 重要：ClusterRole + RoleBinding（不是 ClusterRoleBinding）
+         → 只在 RoleBinding 所在的 namespace 生效
+```
+
+**作用域矩陣（常考）：**
+
+| 組合 | 生效範圍 |
+|---|---|
+| Role + RoleBinding | 單一 namespace |
+| ClusterRole + RoleBinding | 單一 namespace（ClusterRole 降級） |
+| ClusterRole + ClusterRoleBinding | 整個叢集 |
+| Role + ClusterRoleBinding | ❌ 不合法 |
+
+### 2.3 RBAC 物件完整範例
+
+```yaml
+# Step 1: 定義 Role（namespace 範圍的權限）
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: pod-reader
+  namespace: dev
+rules:
+- apiGroups: [""]              # "" 代表 core API group（Pod、Service、ConfigMap...）
+  resources: ["pods"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources: ["pods/log"]      # subresource
+  verbs: ["get"]
+- apiGroups: ["apps"]          # apps group（Deployment、StatefulSet...）
+  resources: ["deployments"]
+  verbs: ["get", "list"]
+
+---
+# Step 2: 綁定（RoleBinding）
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: pod-reader-binding
+  namespace: dev
+subjects:
+- kind: ServiceAccount
+  name: my-app-sa
+  namespace: dev              # SA 的 namespace（跨 namespace 時必須指定）
+- kind: User
+  name: alice
+  apiGroup: rbac.authorization.k8s.io
+- kind: Group
+  name: dev-team
+  apiGroup: rbac.authorization.k8s.io
+roleRef:                       # roleRef 一旦建立不可修改（需刪除重建）
+  kind: Role
+  name: pod-reader
+  apiGroup: rbac.authorization.k8s.io
+```
+
+### 2.4 apiGroups 對照表
+
+Kubernetes API 按功能分組，RBAC rules 中必須填寫正確的 apiGroup：
+
+| apiGroup | 包含的資源 |
+|---|---|
+| `""` (core) | Pod, Service, ConfigMap, Secret, PVC, Node, Namespace, SA |
+| `apps` | Deployment, StatefulSet, DaemonSet, ReplicaSet |
+| `batch` | Job, CronJob |
+| `networking.k8s.io` | Ingress, NetworkPolicy |
+| `rbac.authorization.k8s.io` | Role, ClusterRole, RoleBinding, ClusterRoleBinding |
+| `storage.k8s.io` | StorageClass, PersistentVolume |
+| `policy` | PodDisruptionBudget |
+
+```bash
+# 查詢資源屬於哪個 apiGroup
+kubectl api-resources --sort-by name | grep -E "^NAME|deployment|ingress|networkpol"
+# NAME              SHORTNAMES   APIVERSION              NAMESPACED
+# deployments       deploy       apps/v1                 true
+# ingresses         ing          networking.k8s.io/v1    true
+# networkpolicies   netpol       networking.k8s.io/v1    true
+```
+
+### 2.5 內建 ClusterRole
+
+Kubernetes 預設提供幾個重要的 ClusterRole：
+
+| ClusterRole | 用途 |
+|---|---|
+| `cluster-admin` | 完整叢集管理員（等同 root） |
+| `admin` | namespace 管理員（可管理 RBAC 以外的所有資源） |
+| `edit` | 可讀寫大多數資源，但不能改 RBAC |
+| `view` | 唯讀，不能看 Secret |
+| `system:node` | kubelet 所需的最小權限 |
+| `system:kube-proxy` | kube-proxy 所需權限 |
+
+### 2.6 RBAC 驗證指令
+
+```bash
+# 確認自己有什麼權限
+kubectl auth can-i --list
+
+# 模擬其他身份（impersonation，需有 impersonate 權限）
+kubectl auth can-i list pods --as=system:serviceaccount:dev:my-sa
+kubectl auth can-i list pods --as=system:serviceaccount:dev:my-sa -n dev
+
+# 查看某個 SA 的所有 RoleBinding/ClusterRoleBinding
+kubectl get rolebindings,clusterrolebindings -A -o json | \
+  jq '.items[] | select(.subjects[]? | .kind=="ServiceAccount" and .name=="my-sa")'
+```
+
+---
+
+## 三、ServiceAccount 深度說明
+
+### 3.1 ServiceAccount 的設計目的
+
+**User** 代表人類使用者，**ServiceAccount（SA）** 代表 **Pod（程式）的身份**：
+
+```
+人類管理員                       Pod 中的應用程式
+    │                                  │
+    │ kubectl（X.509 cert）             │ HTTP 呼叫 K8s API
+    │ Username: kubernetes-admin       │ 需要身份來取得授權
+    ▼                                  ▼
+kube-apiserver                    kube-apiserver
+    認證 → RBAC 授權                   認證 → RBAC 授權
+                                       ↑
+                               ServiceAccount Token
+                               自動掛載進 Pod
+```
+
+### 3.2 ServiceAccount Token 演進
+
+**舊版（K8s 1.23 以前）：Secret-based Token**
+
+```
+建立 SA → 自動建立 Secret（type: kubernetes.io/service-account-token）
+→ Secret 中有永不過期的 JWT token
+→ 自動掛載到 /var/run/secrets/kubernetes.io/serviceaccount/token
+```
+
+問題：Token **永不過期**，若 Secret 洩漏風險極高。
+
+**新版（K8s 1.24+）：Projected Token（TokenRequest API）**
+
+```
+Pod 啟動 → kubelet 向 TokenRequest API 申請短期 token
+→ 預設有效期 1 小時（由 kube-apiserver --service-account-max-token-expiration 控制）
+→ kubelet 自動在過期前 80% 時間點更新
+→ 掛載方式變為 projected volume（不再是 Secret）
+```
+
+```yaml
+# 新版 projected volume（kubelet 自動注入，無需手動設定）
+volumes:
+- name: kube-api-access
+  projected:
+    sources:
+    - serviceAccountToken:
+        expirationSeconds: 3607    # 自動輪換
+        path: token
+    - configMap:
+        name: kube-root-ca.crt     # CA 憑證
+        items:
+        - key: ca.crt
+          path: ca.crt
+    - downwardAPI:
+        items:
+        - path: namespace
+          fieldRef:
+            fieldPath: metadata.namespace
+```
+
+### 3.3 Pod 中 SA Token 的掛載路徑
+
+```bash
+# 在 Pod 內查看自動掛載的 token
+ls /var/run/secrets/kubernetes.io/serviceaccount/
+# ca.crt    namespace    token
+
+# 使用 token 呼叫 API Server
+TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+NAMESPACE=$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace)
+CA=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+
+curl -s --cacert $CA \
+  -H "Authorization: Bearer $TOKEN" \
+  https://kubernetes.default.svc/api/v1/namespaces/$NAMESPACE/pods
+```
+
+### 3.4 SA 安全最佳實踐
+
+**問題：default SA 被所有 Pod 自動使用**
+
+```
+namespace: production
+├── Pod A（沒指定 SA）→ 自動使用 default SA
+├── Pod B（沒指定 SA）→ 自動使用 default SA
+└── Pod C（沒指定 SA）→ 自動使用 default SA
+
+若 default SA 被授予過高權限 → 任一 Pod 被入侵都可存取 API
+```
+
+**正確做法：最小權限原則**
+
+```yaml
+# 1. 為應用建立專用 SA
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: order-service-sa
+  namespace: production
+
+---
+# 2. 只授予必要權限
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: order-service-role
+  namespace: production
+rules:
+- apiGroups: [""]
+  resources: ["configmaps"]
+  resourceNames: ["order-config"]   # 只能讀特定 ConfigMap（resourceNames 限縮）
+  verbs: ["get"]
+
+---
+# 3. Pod 明確指定 SA，停用不需要的 token
+spec:
+  serviceAccountName: order-service-sa
+  automountServiceAccountToken: false   # 若完全不需要 API 存取
+```
+
+### 3.5 跨 Namespace 授權
+
+SA 是 namespace 資源，跨 namespace 授權需要在 RoleBinding 中明確指定 SA 的 namespace：
+
+```yaml
+# 允許 monitoring namespace 的 prometheus SA 讀取 production namespace 的 Pod
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: prometheus-pod-reader
+  namespace: production          # ← RoleBinding 在 production namespace
+subjects:
+- kind: ServiceAccount
+  name: prometheus
+  namespace: monitoring          # ← SA 在不同的 namespace
+roleRef:
+  kind: ClusterRole
+  name: view
+  apiGroup: rbac.authorization.k8s.io
+```
+
+---
+
+## 四、RBAC 問題排查指引
+
+```
+問題：Pod 呼叫 API 收到 403 Forbidden
+
+排查步驟：
+1. 確認 Pod 使用哪個 SA
+   kubectl get pod <name> -o jsonpath='{.spec.serviceAccountName}'
+
+2. 確認 SA 有哪些 binding
+   kubectl get rolebindings,clusterrolebindings -A \
+     -o custom-columns='NAME:.metadata.name,ROLE:.roleRef.name,SUBJECTS:.subjects' | grep <sa-name>
+
+3. 模擬該 SA 的權限
+   kubectl auth can-i <verb> <resource> \
+     --as=system:serviceaccount:<namespace>:<sa-name> -n <namespace>
+
+4. 查看 API Server audit log 確認拒絕原因
+   grep "403" /var/log/kubernetes/audit.log | jq '.user,.verb,.objectRef'
+```
+
+| 症狀 | 原因 | 解法 |
+|---|---|---|
+| `403 Forbidden` | SA 無對應 RoleBinding | 建立 RoleBinding |
+| `403` 但 RoleBinding 存在 | apiGroup 填錯（如用 `apps` 但資源在 core）| 確認 `kubectl api-resources` |
+| ClusterRoleBinding 建立但只在部分 ns 生效 | 用了 RoleBinding 而非 ClusterRoleBinding | 確認 binding 種類 |
+| Pod 使用 wrong SA | 沒有指定 `serviceAccountName` | 明確指定 SA 名稱 |
+| Token 掛載但 API 回 401 | Token 過期或 SA 被刪除重建（token 失效） | 重啟 Pod 取得新 token |
+
+---
+
+# NetworkPolicy 原理深度說明
+
+本章說明 NetworkPolicy 的選擇器語義、CNI 實作機制，以及四種 default-deny 模式的完整圖解。
+
+---
+
+## 一、NetworkPolicy 的本質
+
+NetworkPolicy 是 Kubernetes **宣告式的 L3/L4 防火牆規則**，定義 Pod 可以與誰通訊：
+
+```
+沒有 NetworkPolicy 的叢集（預設）：
+  任何 Pod ←→ 任何 Pod（無限制）
+  任何 Pod ←→ 任何外部 IP（無限制）
+
+有 NetworkPolicy 後：
+  只有「被允許的流量」才能通過
+  沒有明確允許 = 拒絕（當 Pod 被至少一條 NP 選中時）
+```
+
+**重要前提：NetworkPolicy 需要 CNI 插件支援才能生效。**
+
+| CNI | 支援 NetworkPolicy |
+|---|---|
+| Flannel（純 VXLAN） | ❌ 不支援 |
+| Calico | ✅ 支援（且有額外的 GlobalNetworkPolicy） |
+| Cilium | ✅ 支援（基於 eBPF，效能更佳） |
+| Weave Net | ✅ 支援 |
+
+Flannel 叢集建立 NetworkPolicy 物件不會報錯，但規則**不生效**。
+
+---
+
+## 二、選擇器語義完整解析
+
+### 2.1 NetworkPolicy 作用於哪些 Pod（podSelector）
+
+NetworkPolicy 用 `spec.podSelector` 決定這條規則**保護哪些 Pod**（被管理的 Pod）：
+
+```yaml
+spec:
+  podSelector:
+    matchLabels:
+      app: backend      # 只保護有 app=backend label 的 Pod
+```
+
+```yaml
+spec:
+  podSelector: {}       # 空選擇器 = 選中此 namespace 中的所有 Pod
+```
+
+### 2.2 Ingress / Egress 方向
+
+```
+Ingress（入站）：誰可以發流量「進入」被保護的 Pod
+Egress（出站）：被保護的 Pod 可以發流量「去往」哪裡
+
+Pod A ──(Egress 規則管這條)──► Pod B ──(Ingress 規則管這條)──► Pod B 收到請求
+                                         ↑
+                              被 podSelector 選中的 Pod
+```
+
+```yaml
+spec:
+  podSelector:
+    matchLabels:
+      app: backend
+  policyTypes:
+  - Ingress     # 聲明管理 Ingress（如不列出，有 ingress 規則時自動啟用）
+  - Egress      # 聲明管理 Egress（必須明確列出才生效）
+```
+
+### 2.3 三種來源/目的地選擇器
+
+#### podSelector — 按 Pod label 選
+
+```yaml
+ingress:
+- from:
+  - podSelector:
+      matchLabels:
+        role: frontend    # 允許 app=frontend 的 Pod 進入
+                          # 僅限同一 namespace（跨 ns 需搭配 namespaceSelector）
+```
+
+#### namespaceSelector — 按 Namespace label 選
+
+```yaml
+ingress:
+- from:
+  - namespaceSelector:
+      matchLabels:
+        environment: prod  # 允許有 environment=prod label 的 namespace 中的所有 Pod
+```
+
+```bash
+# 為 namespace 加上 label（才能被 namespaceSelector 選到）
+kubectl label namespace monitoring environment=monitoring
+```
+
+#### ipBlock — 按 IP CIDR 選
+
+```yaml
+ingress:
+- from:
+  - ipBlock:
+      cidr: 172.16.0.0/16    # 允許來自這個 CIDR 的流量
+      except:
+      - 172.16.1.0/24        # 但排除這個子網
+```
+
+### 2.4 AND vs OR：最常見的混淆點
+
+**同一個 `from` 清單元素中的多個 selector → AND（同時滿足）**
+
+```yaml
+ingress:
+- from:
+  - podSelector:
+      matchLabels:
+        role: frontend
+    namespaceSelector:         # 注意：同一個 "-" 下，沒有新的 "-"
+      matchLabels:
+        environment: prod
+# 含義：Pod 必須同時滿足
+#   1. 有 role=frontend label
+#   2. 且在有 environment=prod label 的 namespace 中
+# → AND 關係
+```
+
+**不同的 `from` 清單元素 → OR（滿足任一即可）**
+
+```yaml
+ingress:
+- from:
+  - podSelector:               # 第一個元素
+      matchLabels:
+        role: frontend
+  - namespaceSelector:         # 第二個元素（新的 "-"）
+      matchLabels:
+        environment: prod
+# 含義：
+#   1. 有 role=frontend label 的 Pod（任何 namespace）
+#   OR
+#   2. 在有 environment=prod label 的 namespace 中的任何 Pod
+# → OR 關係
+```
+
+**視覺對比：**
+
+```
+AND（同一個 map）：         OR（不同的 list item）：
+- podSelector: A           - podSelector: A
+  namespaceSelector: B     - namespaceSelector: B
+  ↑ 同一個 map entry         ↑ 兩個獨立 list entry
+```
+
+### 2.5 ports 欄位
+
+```yaml
+ingress:
+- from:
+  - podSelector:
+      matchLabels:
+        role: frontend
+  ports:
+  - protocol: TCP
+    port: 8080              # 只允許 TCP:8080
+  - protocol: TCP
+    port: 8443
+  # 若 ports 欄位缺失 → 允許所有 port
+  # 若 ports 指定 → 只允許列出的 port
+```
+
+---
+
+## 三、四種 Default-Deny 模式
+
+### 3.1 拒絕所有 Ingress（最常用）
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: production
+spec:
+  podSelector: {}    # 選中所有 Pod
+  policyTypes:
+  - Ingress          # 只管 Ingress，不影響 Egress
+  # ingress: 欄位不存在 → 沒有任何允許規則 → 全部拒絕
+```
+
+```
+效果：
+  外部 → production 中任何 Pod   ❌
+  其他 ns → production 中任何 Pod ❌
+  production 中 Pod → 外部        ✅（Egress 未受管）
+```
+
+### 3.2 拒絕所有 Egress
+
+```yaml
+spec:
+  podSelector: {}
+  policyTypes:
+  - Egress
+  # egress: 欄位不存在 → 全部出站拒絕
+```
+
+**注意：** 拒絕所有 Egress 後，DNS 查詢（UDP/TCP 53 → CoreDNS）也會被阻斷，Pod 無法解析 Service 名稱。通常需要加上 DNS 白名單：
+
+```yaml
+spec:
+  podSelector: {}
+  policyTypes:
+  - Egress
+  egress:
+  - ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53              # 允許 DNS 查詢
+```
+
+### 3.3 同時拒絕 Ingress + Egress
+
+```yaml
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  - Egress
+  # 兩個 policyTypes 都不設規則 → 完全隔離
+```
+
+### 3.4 允許所有 Ingress（解除限制）
+
+```yaml
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  ingress:
+  - {}                      # 空規則 = 允許所有來源的所有 port
+```
+
+---
+
+## 四、NetworkPolicy 疊加行為
+
+一個 Pod 可以同時被**多條** NetworkPolicy 選中，規則取**聯集（OR）**：
+
+```
+Pod backend 被以下 NP 選中：
+  NP-1：允許來自 frontend Pod 的 :8080
+  NP-2：允許來自 monitoring namespace 的 :8080
+
+結果：
+  frontend Pod → backend:8080     ✅  （NP-1 允許）
+  monitoring Pod → backend:8080   ✅  （NP-2 允許）
+  other Pod → backend:8080        ❌  （無任何 NP 允許）
+  frontend Pod → backend:9090     ❌  （兩條 NP 都只允許 8080）
+```
+
+**不存在「拒絕規則」的概念**：NetworkPolicy 只有**允許規則**，沒有明確拒絕。邏輯是：
+- Pod 未被任何 NP 的 podSelector 選中 → 完全不受限（允許所有）
+- Pod 被至少一條 NP 選中 → 只有被規則明確允許的流量才通過
+
+---
+
+## 五、CNI 如何實作 NetworkPolicy
+
+### 5.1 iptables 實作（Calico 預設）
+
+Calico 將 NetworkPolicy 轉換為 iptables 規則（與 kube-proxy 類似的機制）：
+
+```
+封包進入 Node → iptables FORWARD chain
+  → cali-FORWARD → cali-from-hep-forward
+    → 查詢 ipset（Pod IP 集合）
+    → 比對 NetworkPolicy 規則
+    → ACCEPT 或 DROP
+```
+
+```bash
+# 在有 Calico 的 Node 上查看生成的 iptables 規則
+iptables -L -n | grep cali
+# Chain cali-FORWARD (1 references)
+# Chain cali-fw-caliXXXXXX (pod 的 veth 介面)
+# ...
+```
+
+### 5.2 eBPF 實作（Cilium）
+
+Cilium 使用 eBPF 在 kernel 層攔截封包，效能優於 iptables：
+
+```
+封包 → kernel 網路棧
+  → eBPF hook（XDP 或 tc ingress/egress）
+  → 查詢 Cilium BPF map（NetworkPolicy 規則存入 BPF map）
+  → 允許 / 丟棄（在 kernel 內完成，不進 iptables）
+```
+
+優勢：
+- 規則更新不需要重建整張 iptables（O(1) 查詢 BPF map vs O(n) iptables 遍歷）
+- 支援 L7 策略（HTTP path、gRPC method）
+
+---
+
+## 六、NetworkPolicy 完整範例：前後端隔離
+
+```yaml
+# 場景：
+#   frontend Pod (app=frontend) → backend Pod (app=backend) :8080
+#   backend Pod → database Pod (app=db) :5432
+#   其他全部拒絕
+
+---
+# 1. backend 只接受來自 frontend 的 :8080
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: backend-ingress
+  namespace: production
+spec:
+  podSelector:
+    matchLabels:
+      app: backend
+  policyTypes: [Ingress]
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          app: frontend
+    ports:
+    - protocol: TCP
+      port: 8080
+
+---
+# 2. database 只接受來自 backend 的 :5432
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: db-ingress
+  namespace: production
+spec:
+  podSelector:
+    matchLabels:
+      app: db
+  policyTypes: [Ingress]
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          app: backend
+    ports:
+    - protocol: TCP
+      port: 5432
+
+---
+# 3. default-deny：其他所有 Pod 的 Ingress 全部拒絕
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: production
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+```
+
+---
+
+## 七、NetworkPolicy 問題排查指引
+
+```
+問題：Pod 無法連線到另一個 Pod / Service
+
+排查步驟：
+1. 確認 CNI 是否支援 NetworkPolicy
+   kubectl get pods -n kube-system | grep -E "calico|cilium|weave"
+   # 若只有 flannel → NetworkPolicy 不生效
+
+2. 列出影響目標 Pod 的所有 NetworkPolicy
+   kubectl get networkpolicy -n <namespace>
+   kubectl describe networkpolicy <name> -n <namespace>
+
+3. 確認 Pod labels（是否被 podSelector 選中）
+   kubectl get pod <pod-name> --show-labels
+
+4. 測試連線（在來源 Pod 內）
+   kubectl exec -it <source-pod> -- curl -m 3 <target-ip>:<port>
+   kubectl exec -it <source-pod> -- nc -zv <target-ip> <port>
+```
+
+| 症狀 | 根本原因 | 解法 |
+|---|---|---|
+| NetworkPolicy 建立但沒有效果 | CNI 不支援（如 Flannel） | 換用 Calico / Cilium |
+| 允許特定 Pod 但流量仍被擋 | 同時有 default-deny NP + 允許規則 AND 條件不符 | 確認 label 完全一致 |
+| 允許 Egress 但 DNS 不通 | 沒有放行 UDP/TCP 53 | 加上 DNS egress 規則 |
+| 跨 namespace 流量被擋 | 只用 podSelector（預設限同 ns） | 加上 namespaceSelector |
+| 部分 Port 通，部分不通 | ports 欄位只列了部分 port | 新增 port 到規則中 |
+
+---
+
 ## CKA 題目
 
 ### CKA-Q1：查看叢集狀態與節點資訊
