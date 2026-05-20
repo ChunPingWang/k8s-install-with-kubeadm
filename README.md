@@ -817,6 +817,636 @@ kubectl get pods -A
 
 ---
 
+# 網路原理深度說明
+
+本章從 Linux 網路基礎出發，逐層建立「為什麼 Kubernetes 網路這樣設計」的完整認識。
+
+---
+
+## 一、Linux 網路基礎
+
+### 1.1 Network Namespace — 網路的隔離單位
+
+Linux **Network Namespace** 是容器網路隔離的核心機制。每個 namespace 擁有獨立的：
+- 網路介面（Network Interface）
+- 路由表（Routing Table）
+- iptables 規則
+- socket
+
+```bash
+# 建立兩個 namespace（手動模擬容器網路）
+ip netns add ns-a
+ip netns add ns-b
+
+# 在 namespace 內執行指令
+ip netns exec ns-a ip link show
+# → 只看到 lo（loopback），完全與主機隔離
+```
+
+預設情況下 ns-a 和 ns-b **無法互通**，需要額外的虛擬設備連接它們。
+
+---
+
+### 1.2 veth Pair — 虛擬乙太網路對
+
+**veth（Virtual Ethernet）** 是成對出現的虛擬網路介面，像一條管子：從一端送入的封包，從另一端出來。
+
+```bash
+# 建立 veth pair：veth-a ↔ veth-b
+ip link add veth-a type veth peer name veth-b
+
+# 將 veth-a 放進 ns-a，veth-b 放進 ns-b
+ip link set veth-a netns ns-a
+ip link set veth-b netns ns-b
+
+# 設定 IP
+ip netns exec ns-a ip addr add 10.0.0.1/24 dev veth-a
+ip netns exec ns-b ip addr add 10.0.0.2/24 dev veth-b
+
+# 啟動介面
+ip netns exec ns-a ip link set veth-a up
+ip netns exec ns-b ip link set veth-b up
+
+# 現在 ns-a 可以 ping ns-b
+ip netns exec ns-a ping 10.0.0.2
+```
+
+**Container 網路的 veth 使用方式：**
+
+```
+主機（Host Network Namespace）
+  veth0 ────────── veth1（Container 內部，通常叫 eth0）
+  │
+  bridge（docker0 / cni0）
+```
+
+每個 Container 建立一對 veth：一端在 Container 的 namespace，另一端接到主機的 bridge。
+
+---
+
+### 1.3 Linux Bridge — 軟體交換器
+
+**Linux Bridge** 是作業系統裡的 Layer 2 交換器，連接多個網路介面，依據 MAC 位址轉發封包。
+
+```
+           Linux Bridge（cni0 / docker0）
+           ┌──────────────────────────────┐
+           │  MAC Table:                  │
+           │  52:54:00:aa → veth1         │
+           │  52:54:00:bb → veth3         │
+           │  52:54:00:cc → veth5         │
+           └──┬────────┬────────┬─────────┘
+              │        │        │
+            veth1    veth3    veth5   ← 主機端
+              │        │        │
+            eth0     eth0     eth0   ← Container 內部
+          (Pod A)  (Pod B)  (Pod C)
+         10.244.1.2  10.244.1.3  10.244.1.4
+```
+
+同一個節點上的 Pod 之間通訊，封包路徑：
+```
+Pod A eth0 → veth1 → bridge（cni0）→ veth3 → Pod B eth0
+```
+**不需要經過 IP 路由，純 Layer 2 轉發。**
+
+---
+
+### 1.4 iptables — Linux 封包過濾與 NAT
+
+**iptables** 是 Linux 核心的封包處理框架，kube-proxy 用它實作 Kubernetes Service。
+
+**五個 Tables（依功能分類）：**
+
+| Table | 用途 |
+|-------|------|
+| `filter` | 封包過濾（允許/拒絕） |
+| `nat` | 網路位址轉換（SNAT/DNAT） |
+| `mangle` | 修改封包欄位（TTL、TOS 等） |
+| `raw` | 跳過 connection tracking |
+| `security` | SELinux 標記 |
+
+**五個 Chains（封包經過的時間點）：**
+
+```
+封包進入 → PREROUTING → FORWARD → POSTROUTING → 送出
+                ↓
+           INPUT（本機處理）
+                ↓
+           本機程式產生封包
+                ↓
+           OUTPUT → POSTROUTING → 送出
+```
+
+**kube-proxy 如何實作 ClusterIP Service（DNAT）：**
+
+```bash
+# Service: ClusterIP = 10.96.0.10:80，後端 Pod = 10.244.1.2:8080
+
+# iptables 規則（kube-proxy 自動產生）：
+# 1. PREROUTING chain：封包目標是 10.96.0.10:80 → 跳到 KUBE-SVC-xxx
+iptables -t nat -A PREROUTING -d 10.96.0.10/32 -p tcp --dport 80 \
+  -j KUBE-SVC-XXXXXXXX
+
+# 2. KUBE-SVC chain：隨機選取一個後端
+iptables -t nat -A KUBE-SVC-XXXXXXXX \
+  -m statistic --mode random --probability 0.5 \
+  -j KUBE-SEP-AAAAAAAA   # → Pod A
+iptables -t nat -A KUBE-SVC-XXXXXXXX \
+  -j KUBE-SEP-BBBBBBBB   # → Pod B
+
+# 3. KUBE-SEP chain：DNAT 到真實 Pod IP
+iptables -t nat -A KUBE-SEP-AAAAAAAA \
+  -p tcp -j DNAT --to-destination 10.244.1.2:8080
+```
+
+封包進入節點時，`PREROUTING` 的 DNAT 規則將目標 IP 從 ClusterIP 改為 Pod IP，之後正常路由到 Pod。**ClusterIP 不是真實存在的 IP**，它只存在於 iptables 規則中。
+
+---
+
+## 二、VLAN 原理
+
+### 2.1 VLAN 解決的問題
+
+在傳統乙太網路中，所有設備共用同一個廣播域（Broadcast Domain）。一台設備發送廣播封包，所有設備都會收到，造成：
+- 廣播風暴（Broadcast Storm）
+- 安全隔離問題
+- 大型網路效能下降
+
+**VLAN（Virtual LAN）** 在同一套實體交換器上劃分出多個邏輯網段，每個 VLAN 是獨立的廣播域。
+
+```
+實體交換器（一台）
+┌────────────────────────────────────────────┐
+│  Port 1,2,3 → VLAN 10（業務部門）           │
+│  Port 4,5,6 → VLAN 20（研發部門）           │
+│  Port 7,8,9 → VLAN 30（管理網路）           │
+└────────────────────────────────────────────┘
+  VLAN 10 的廣播封包 ≠ 不會到達 VLAN 20
+```
+
+---
+
+### 2.2 802.1Q 標籤格式
+
+VLAN 使用 **IEEE 802.1Q** 標準，在乙太網路幀中插入 4 bytes 的 VLAN Tag：
+
+```
+原始乙太網路幀：
+┌──────────┬──────────┬───────┬──────────────────┬─────┐
+│ Dst MAC  │ Src MAC  │ EType │    Payload        │ FCS │
+│  6 bytes │  6 bytes │2 bytes│                   │4 B  │
+└──────────┴──────────┴───────┴──────────────────┴─────┘
+
+802.1Q 標記幀（Tagged Frame）：
+┌──────────┬──────────┬───────┬────────────┬───────┬──────────────────┬─────┐
+│ Dst MAC  │ Src MAC  │ 0x8100│  VLAN Tag  │ EType │    Payload        │ FCS │
+│  6 bytes │  6 bytes │2 bytes│  4 bytes   │2 bytes│                   │4 B  │
+└──────────┴──────────┴───────┴────────────┴───────┴──────────────────┴─────┘
+                              ↑
+                    VLAN Tag 細節：
+                    ┌──────────┬──────────────────┐
+                    │  PCP(3b) │  DEI(1b) │VID(12b)│
+                    │ 優先順序  │  丟棄指示 │ VLAN ID│
+                    └──────────┴──────────────────┘
+                    VID 範圍：0-4095（12 bits）
+                    實際可用：1-4094（0 和 4095 保留）
+```
+
+**PCP（Priority Code Point）：** QoS 優先順序（0-7）
+**VID（VLAN Identifier）：** VLAN 編號，12 bits = **最多 4094 個 VLAN**
+
+---
+
+### 2.3 VLAN 的限制 — 為什麼雲端需要 VXLAN
+
+| 限制 | 說明 |
+|------|------|
+| **4094 個 VLAN 上限** | 大型雲端有數百萬租戶，4094 個遠遠不夠 |
+| **L2 邊界限制** | VLAN 無法跨越 L3 路由器，只能在同一廣播域內工作 |
+| **資料中心跨機房** | 不同機房之間透過 L3 IP 路由連接，VLAN 無法直接延伸 |
+| **MAC Table 爆炸** | 大量虛擬機的 MAC 位址塞爆交換器的 MAC Table |
+
+這些限制推動了 **Overlay Network** 技術的誕生，VXLAN 是其中最廣泛使用的方案。
+
+---
+
+## 三、VXLAN 詳細原理
+
+### 3.1 VXLAN 的設計目標
+
+**VXLAN（Virtual eXtensible LAN）** 是 RFC 7348 定義的標準，核心思想是：
+
+> 把 Layer 2 乙太網路幀「裝進」UDP 封包傳輸，讓 L2 網路可以跨越 L3 路由器延伸。
+
+```
+「隧道」比喻：
+  ┌──────────────────────────────────────────────────┐
+  │  外層（L3 IP + UDP）：給實體網路看的地址            │
+  │  ┌────────────────────────────────────────────┐   │
+  │  │  VXLAN Header：VNI（虛擬網路識別碼）         │   │
+  │  │  ┌──────────────────────────────────────┐  │   │
+  │  │  │  內層（原始 L2 乙太網路幀）             │  │   │
+  │  │  │  包含 Pod 的 MAC、IP、實際資料           │  │   │
+  │  │  └──────────────────────────────────────┘  │   │
+  │  └────────────────────────────────────────────┘   │
+  └──────────────────────────────────────────────────┘
+```
+
+---
+
+### 3.2 VXLAN 幀格式（完整）
+
+```
+實體網路看到的封包（外層 + 內層）：
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          外層乙太網路幀                                       │
+│ ┌──────────┬──────────┬────────┐                                            │
+│ │ Dst MAC  │ Src MAC  │  Type  │  ← VTEP 的 MAC（實體網路）                  │
+│ │（下一跳） │（本節點） │(0x0800)│                                            │
+│ └──────────┴──────────┴────────┘                                            │
+│ ┌────────────────────────────────────────────────────────┐                  │
+│ │                     外層 IP Header                      │                  │
+│ │  Src IP = 192.168.56.11（Node 1）                       │                  │
+│ │  Dst IP = 192.168.56.12（Node 2）                       │                  │
+│ │  Protocol = UDP（17）                                   │                  │
+│ └────────────────────────────────────────────────────────┘                  │
+│ ┌────────────────────────────────────────────────────────┐                  │
+│ │                     外層 UDP Header                     │                  │
+│ │  Src Port = 隨機（通常 49152-65535，由 inner 封包 hash） │                  │
+│ │  Dst Port = 4789（IANA 標準）或 8472（Linux 預設）       │                  │
+│ └────────────────────────────────────────────────────────┘                  │
+│ ┌────────────────────────────────────────────────────────┐                  │
+│ │                     VXLAN Header（8 bytes）             │                  │
+│ │  Flags(8b)  Reserved(24b)  VNI(24b)  Reserved(8b)      │                  │
+│ │   0x08=1         0         識別虛擬網路     0            │                  │
+│ │                            最多 1677 萬個               │                  │
+│ └────────────────────────────────────────────────────────┘                  │
+│ ┌────────────────────────────────────────────────────────┐                  │
+│ │                  內層乙太網路幀（原始封包）               │                  │
+│ │  Dst MAC = Pod B 的 MAC（10.244.2.20 的 MAC）           │                  │
+│ │  Src MAC = Pod A 的 MAC（10.244.1.10 的 MAC）           │                  │
+│ │  IP: src=10.244.1.10  dst=10.244.2.20                  │                  │
+│ │  TCP/UDP: 實際應用資料                                   │                  │
+│ └────────────────────────────────────────────────────────┘                  │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+大小開銷：外層 Ethernet(14) + IP(20) + UDP(8) + VXLAN(8) = 50 bytes
+→ MTU 需要從 1500 調整到 1550 以上（或調低 Pod 的 MTU 到 1450）
+```
+
+---
+
+### 3.3 VNI — 虛擬網路識別碼
+
+**VNI（VXLAN Network Identifier）** 是 24 bits，可以定義 **2²⁴ = 16,777,216 個**虛擬網路（相比 VLAN 的 4094 個）。
+
+不同的 VNI 代表完全隔離的虛擬網路，即使 Pod IP 相同（10.0.0.1），在不同 VNI 中也不會互相干擾 — 這正是多租戶雲端所需要的隔離能力。
+
+```
+VNI = 100：租戶 A 的網路（10.0.0.0/8）
+VNI = 200：租戶 B 的網路（10.0.0.0/8）← 相同 IP 段，但完全隔離
+VNI = 1：Kubernetes Pod 網路（Flannel 使用 VNI=1）
+```
+
+---
+
+### 3.4 VTEP — VXLAN Tunnel Endpoint
+
+**VTEP（VXLAN Tunnel Endpoint）** 是 VXLAN 的終端設備，負責**封裝（encapsulate）**和**解封裝（decapsulate）**。
+
+在 Kubernetes 中，每個節點上的 `flannel.1` 介面就是一個 VTEP：
+
+```bash
+# 查看節點上的 VTEP
+ip link show flannel.1
+# → flannel.1: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1450 qdisc noqueue
+#   link/ether 52:54:00:xx:xx:xx brd ff:ff:ff:ff:ff:ff
+
+# 查看 VTEP 的 ARP/FDB 表（知道哪個 Pod IP/MAC 在哪個節點）
+ip neigh show dev flannel.1
+# → 10.244.2.0 lladdr 52:54:00:yy:yy:yy PERMANENT  ← Node 2 的 VTEP MAC
+
+bridge fdb show dev flannel.1
+# → 52:54:00:yy:yy:yy dst 192.168.56.12 self permanent  ← VTEP 在 Node 2
+```
+
+---
+
+### 3.5 VTEP 如何學習遠端節點資訊
+
+VTEP 需要知道「目標 Pod IP 在哪個節點上」，有兩種學習機制：
+
+**方式一：Multicast（傳統 VXLAN，Flannel 早期版本）**
+
+```
+Pod A 要送封包給 10.244.2.20（不知道它在哪個節點）
+→ VTEP 發送 ARP 廣播，封裝進 VXLAN，用 UDP Multicast 傳送
+→ 所有節點的 VTEP 收到，回應自己節點的資訊
+→ VTEP 學習並記錄對應關係
+```
+缺點：需要實體網路支援 Multicast，雲端環境通常不支援。
+
+**方式二：Unicast + 控制平面（Flannel 目前使用）**
+
+```
+Flannel 的 flanneld daemon 監聽 etcd
+→ 新節點加入時，flanneld 將節點 IP 和 Pod CIDR 寫入 etcd
+→ 所有節點的 flanneld 讀取 etcd，更新本機的路由表和 FDB 表
+→ VTEP 直接用 Unicast 送封包，不需要廣播
+```
+
+```bash
+# Flannel 寫入的路由規則（每個節點自動維護）
+ip route show
+# → 10.244.0.0/24 dev cni0  proto kernel scope link src 10.244.0.1
+# → 10.244.1.0/24 via 10.244.1.0 dev flannel.1 onlink  ← 到 Node 1 的路由
+# → 10.244.2.0/24 via 10.244.2.0 dev flannel.1 onlink  ← 到 Node 2 的路由
+```
+
+---
+
+### 3.6 完整封包流程（含各層細節）
+
+```
+情境：Pod A（10.244.1.10，Node 1）→ Pod B（10.244.2.20，Node 2）
+
+─── Node 1 內部 ──────────────────────────────────────────────────────
+
+[Step 1] Pod A 送出封包
+  src=10.244.1.10  dst=10.244.2.20
+  Pod A 路由表：default via eth0 → 送到 veth → 出 bridge
+
+[Step 2] cni0 bridge 查 MAC Table
+  10.244.2.20 不在本節點 → 不在 bridge 的 MAC Table
+  → 查主機路由表
+
+[Step 3] 主機路由表
+  10.244.2.0/24 via 10.244.2.0 dev flannel.1 onlink
+  → 封包交給 flannel.1（VTEP）處理
+
+[Step 4] VTEP 封裝（flannel.1）
+  查 ARP/FDB 表：10.244.2.0 → Node 2 的 VTEP MAC，在 192.168.56.12
+  建立 VXLAN 封包：
+    外層 IP:  src=192.168.56.11  dst=192.168.56.12
+    外層 UDP: dst port=8472
+    VXLAN:   VNI=1
+    內層:    原始封包（src=10.244.1.10, dst=10.244.2.20）
+
+[Step 5] 透過 eth1（Host-only 192.168.56.x 網路）送出
+
+─── 實體網路傳輸 ──────────────────────────────────────────────────────
+
+[Step 6] 封包到達 Node 2（192.168.56.12）的 eth1
+
+─── Node 2 內部 ──────────────────────────────────────────────────────
+
+[Step 7] VTEP 解封裝（flannel.1）
+  收到 UDP:8472 封包 → 識別為 VXLAN
+  剝除外層 Ethernet + IP + UDP + VXLAN Header
+  還原內層封包：src=10.244.1.10  dst=10.244.2.20
+
+[Step 8] 主機路由表
+  10.244.2.0/24 dev cni0 proto kernel scope link
+  → 送進 cni0 bridge
+
+[Step 9] cni0 bridge 查 MAC Table
+  10.244.2.20 → veth on bridge → Pod B 的 veth
+
+[Step 10] 封包到達 Pod B（10.244.2.20）的 eth0
+```
+
+---
+
+## 四、Container 網路模型
+
+### 4.1 單機 Container 網路（Docker 模型）
+
+```
+主機（Host）
+┌──────────────────────────────────────────────────────┐
+│  docker0（Linux Bridge，172.17.0.1/16）               │
+│     ├── veth0a ←→ eth0（Container A，172.17.0.2）     │
+│     ├── veth0b ←→ eth0（Container B，172.17.0.3）     │
+│     └── veth0c ←→ eth0（Container C，172.17.0.4）     │
+│                                                       │
+│  iptables MASQUERADE（SNAT）：                         │
+│  Container → 外部網路 時，來源 IP 換成主機 IP           │
+│  172.17.0.x → 192.168.56.11                           │
+│                                                       │
+│  eth0（192.168.56.11）→ 對外網路                       │
+└──────────────────────────────────────────────────────┘
+```
+
+**Container 存取外部網路的 NAT 流程：**
+
+```
+Container A（172.17.0.2）發出請求：
+  src=172.17.0.2 → dst=8.8.8.8
+
+iptables POSTROUTING MASQUERADE：
+  src=172.17.0.2 → 改為 src=192.168.56.11（主機 IP）
+
+封包送出：src=192.168.56.11 → dst=8.8.8.8
+回包：    src=8.8.8.8       → dst=192.168.56.11
+iptables Connection Tracking 還原：
+  dst=192.168.56.11 → 還原為 dst=172.17.0.2
+
+回包到達 Container A（172.17.0.2）
+```
+
+---
+
+### 4.2 Kubernetes Pod 網路與 Docker 的差異
+
+| 項目 | Docker | Kubernetes Pod |
+|------|--------|----------------|
+| 每個 container 的 IP | 獨立 IP | 同 Pod 共用一個 IP |
+| container 間通訊 | 透過 NAT 或 link | 直接 localhost |
+| Network namespace | 每個 container 獨立 | Pod 內所有 container 共用 |
+| IP 分配 | Docker 自行管理 | CNI 插件分配 |
+| 跨節點通訊 | 需要 port mapping 或 overlay | CNI 直接 Pod IP 可達 |
+
+**Kubernetes Pod 的 Network Namespace 共享：**
+
+```
+Pod（由 pause container 建立並持有 Network Namespace）
+┌──────────────────────────────────────────────────────┐
+│  Network Namespace（共享）                             │
+│  IP: 10.244.1.10   eth0 ←→ veth → cni0 bridge       │
+│                                                       │
+│  ┌──────────────┐  ┌──────────────┐  ┌────────────┐  │
+│  │ pause(sandbox)│  │  app container│  │sidecar cont│  │
+│  │  （持有 NS）  │  │  （加入 NS）  │  │ （加入 NS） │  │
+│  └──────────────┘  └──────────────┘  └────────────┘  │
+│  三個 container 共用同一個 eth0 和 IP                   │
+│  app 和 sidecar 用 localhost:port 互相通訊              │
+└──────────────────────────────────────────────────────┘
+```
+
+`pause` container（`registry.k8s.io/pause`）幾乎不佔資源，其唯一職責就是在 Pod 的整個生命週期持有這個 Network Namespace，確保即使應用 container 重啟，Pod IP 也不會改變。
+
+---
+
+## 五、Kubernetes 四種流量路徑
+
+### 5.1 Pod → Pod（同節點）
+
+```
+Pod A（10.244.1.2）→ Pod B（10.244.1.3）
+  │
+  ▼ veth pair
+  cni0 bridge（Layer 2 轉發）
+  │
+  ▼ veth pair
+  Pod B（10.244.1.3）
+
+完全在 bridge 內部完成，不經過 IP 路由，不經過 iptables
+（除非有 NetworkPolicy）
+```
+
+---
+
+### 5.2 Pod → Pod（跨節點，VXLAN）
+
+見上方 3.6 節完整封包流程。關鍵路徑：
+
+```
+Pod A → veth → cni0 → 路由表 → flannel.1（VTEP 封裝）
+→ eth1（實體傳輸）
+→ flannel.1（VTEP 解封裝）→ cni0 → veth → Pod B
+```
+
+---
+
+### 5.3 Pod → Service（ClusterIP，iptables DNAT）
+
+```
+Pod A（10.244.1.2）→ Service（10.96.0.10:80）
+  │
+  ▼ iptables PREROUTING（DNAT）
+  DNAT: 10.96.0.10:80 → 10.244.2.3:8080（隨機選取後端 Pod）
+  │
+  ▼ 路由表（10.244.2.0/24 → flannel.1）
+  VXLAN 封裝 → 跨節點傳輸 → Pod B（10.244.2.3:8080）
+
+回程封包：
+  Pod B（10.244.2.3）→ Pod A（10.244.1.2）
+  iptables Connection Tracking 自動還原 src 為 10.96.0.10:80
+```
+
+`ClusterIP` 是「虛擬 IP」，沒有任何介面綁定這個 IP，它只存在於 iptables DNAT 規則中。
+
+---
+
+### 5.4 外部 → NodePort Service
+
+```
+外部客戶端（192.168.56.1）→ 192.168.56.11:30080（NodePort）
+  │
+  ▼ iptables PREROUTING
+  DNAT: 192.168.56.11:30080 → 10.244.2.3:8080（後端 Pod）
+
+  若後端 Pod 在另一個節點（Node 2）：
+  ▼ MASQUERADE（SNAT）
+  src=10.244.1.1（節點 cni0 IP，或 Node 1 IP）
+  → VXLAN 跨節點傳輸 → Pod B
+
+注意：
+  當封包轉發到其他節點上的 Pod 時，需要 SNAT（MASQUERADE），
+  否則 Pod 回包時不知道要送回 Node 1，會直接回給外部客戶端，
+  造成 Client 收到非預期 src IP 的回包。
+```
+
+---
+
+### 5.5 DNS 解析流程（CoreDNS）
+
+Kubernetes 的 DNS 由 **CoreDNS** 提供，部署為 Service（通常是 `10.96.0.10`）。
+
+```
+Pod 的 /etc/resolv.conf（kubelet 自動注入）：
+  nameserver 10.96.0.10       ← CoreDNS Service ClusterIP
+  search default.svc.cluster.local svc.cluster.local cluster.local
+  options ndots:5
+
+Pod 查詢 "my-service" 的 DNS 解析過程：
+  1. 優先嘗試 FQDN 補全：
+     my-service.default.svc.cluster.local → CoreDNS → 10.96.1.5 ✓
+
+  2. CoreDNS 查詢流程：
+     收到查詢 my-service.default.svc.cluster.local
+     → 在 etcd（透過 Kubernetes API）中找到 Service
+     → 回傳 ClusterIP 10.96.1.5
+
+  3. DNS 格式規則：
+     <service>.<namespace>.svc.<cluster-domain>
+     my-service.default.svc.cluster.local
+     │           │        │    └─ 叢集 domain（預設 cluster.local）
+     │           │        └─ 固定
+     │           └─ namespace
+     └─ service 名稱
+```
+
+**Pod 的 DNS 名稱（有時考試會問）：**
+
+```
+Pod IP: 10.244.1.10
+Pod DNS: 10-244-1-10.default.pod.cluster.local
+（IP 中的 . 換成 -）
+```
+
+---
+
+## 六、網路問題排查指引
+
+### 常用診斷指令
+
+```bash
+# 查看節點網路介面（確認 flannel.1 存在）
+ip link show
+
+# 查看 Pod 網路路由
+ip route show
+
+# 查看 VTEP 的 FDB 表（確認知道遠端節點）
+bridge fdb show dev flannel.1
+
+# 查看 iptables 的 NAT 規則（Service 路由）
+sudo iptables -t nat -L KUBE-SERVICES -n --line-numbers | head -20
+
+# 確認 kube-proxy 規則數量（正常應有數百條）
+sudo iptables -t nat -L | wc -l
+
+# Pod-to-Pod 連通性測試
+kubectl run test --image=busybox:1.36 --rm -it --restart=Never \
+  -- ping 10.244.2.3
+
+# 追蹤封包路徑（需要 traceroute）
+kubectl exec -it <pod> -- traceroute 10.244.2.3
+
+# 查看 Pod 的 DNS 設定
+kubectl exec -it <pod> -- cat /etc/resolv.conf
+
+# 測試 Service DNS 解析
+kubectl exec -it <pod> -- nslookup kubernetes.default.svc.cluster.local
+
+# 查看 Flannel 日誌（排查網路問題）
+kubectl logs -n kube-flannel -l app=flannel --tail=50
+```
+
+### 常見網路問題與原因
+
+| 症狀 | 可能原因 | 排查方式 |
+|------|---------|---------|
+| Pod Pending，無 IP | CNI 未安裝或 flannel Pod 未 Ready | `kubectl get pods -n kube-flannel` |
+| 同節點 Pod 無法通訊 | cni0 bridge 未建立或 MTU 問題 | `ip link show cni0` |
+| 跨節點 Pod 無法通訊 | flannel.1 VTEP 未建立，FDB 表空 | `bridge fdb show dev flannel.1` |
+| Service 無法存取 | kube-proxy 未運行，iptables 規則缺失 | `kubectl get pods -n kube-system \| grep proxy` |
+| DNS 解析失敗 | CoreDNS Pod 異常 | `kubectl get pods -n kube-system \| grep coredns` |
+| 節點 NotReady | CNI 插件未正確設定 `--iface` | 查看 flannel pod log |
+
 # CKA / CKAD 考試題目與叢集驗證
 
 以下所有題目均已在本叢集（Kubernetes v1.32.13、Ubuntu 24.04 LTS）實際驗證通過。
