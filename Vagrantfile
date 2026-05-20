@@ -16,13 +16,14 @@ NODES = [
 Vagrant.configure("2") do |config|
   config.vm.box = BOX_NAME
 
-  # 清除上次的 join-command 以避免舊 token 被使用
-  config.trigger.before :up do |trigger|
-    trigger.run = { inline: "rm -f #{File.dirname(__FILE__)}/join-command.sh" }
-  end
-
   NODES.each do |node|
     config.vm.define node[:name] do |vm_config|
+      # 只在 master 啟動前清除舊的 join-command（避免 worker 啟動時誤刪）
+      if node[:role] == "master"
+        vm_config.trigger.before :up do |trigger|
+          trigger.run = { inline: "rm -f #{File.dirname(__FILE__)}/join-command.sh" }
+        end
+      end
       vm_config.vm.hostname = node[:name]
 
       # Host-only 私有網路（VirtualBox 預設允許 192.168.56.0/21）

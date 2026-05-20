@@ -48,7 +48,7 @@ echo ">>> [common] 安裝 containerd"
 install -m 0755 -d /etc/apt/keyrings
 
 curl -fsSL https://download.docker.com/linux/ubuntu/gpg | \
-  gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+  gpg --batch --yes --dearmor -o /etc/apt/keyrings/docker.gpg
 chmod a+r /etc/apt/keyrings/docker.gpg
 
 # 自動偵測 Ubuntu codename
@@ -74,7 +74,7 @@ echo ">>> [common] containerd 安裝完成"
 # ── 7. 安裝 kubeadm / kubelet / kubectl ──────────────────────────────────────
 echo ">>> [common] 新增 Kubernetes apt 套件庫 (v${K8S_VERSION})"
 curl -fsSL "https://pkgs.k8s.io/core:/stable:/v${K8S_VERSION}/deb/Release.key" | \
-  gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+  gpg --batch --yes --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
 
 echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] \
 https://pkgs.k8s.io/core:/stable:/v${K8S_VERSION}/deb/ /" | \
