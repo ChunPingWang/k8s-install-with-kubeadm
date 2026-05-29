@@ -57,12 +57,209 @@ kubectl get pods -A
 | `vagrant destroy -f` | 刪除所有節點 |
 | `vagrant status` | 查看節點狀態 |
 
+### 從 Host 直接使用 kubectl 連線到 Vagrant Master
+
+Vagrant 建立的 Master 節點使用 Host-only 網路（`192.168.56.10:6443`），可從主機直接連線，無需每次 `vagrant ssh`。
+
+#### 前置條件
+
+- 主機已安裝 `kubectl`
+- Vagrant 叢集已啟動（`vagrant up`）
+
+#### 步驟
+
+**1. 將 kubeconfig 從 Master 複製到主機**
+
+```bash
+mkdir -p ~/.kube
+vagrant ssh k8s-master -- sudo cat /etc/kubernetes/admin.conf > ~/.kube/config
+```
+
+**2. 確認 API Server 可連線**
+
+```bash
+curl -k https://192.168.56.10:6443/healthz
+# 預期回應：ok
+```
+
+**3. 驗證叢集狀態**
+
+```bash
+kubectl get nodes -o wide
+kubectl get pods -A
+```
+
+#### 切換回 kind 叢集（若同時使用）
+
+若主機同時有 kind 叢集，可合併 kubeconfig 並用 context 切換：
+
+```bash
+# 合併 kind kubeconfig
+KUBECONFIG=~/.kube/config:<(kind get kubeconfig --name <cluster-name>) \
+  kubectl config view --flatten > /tmp/merged && mv /tmp/merged ~/.kube/config
+
+# 查看所有 context
+kubectl config get-contexts
+
+# 切換 context
+kubectl config use-context kind-<cluster-name>   # 切到 kind
+kubectl config use-context kubernetes-admin@kubernetes  # 切回 Vagrant
+```
+
+#### 移除 Vagrant 叢集 context（不再需要時）
+
+```bash
+kubectl config delete-cluster kubernetes
+kubectl config delete-user kubernetes-admin
+kubectl config delete-context kubernetes-admin@kubernetes
+```
+
+---
+
 ### 注意事項
 
 1. **Vagrant Box**：預設使用 `bento/ubuntu-24.04`。若該 box 尚未發布，可在 `Vagrantfile` 第一行修改為 `bento/ubuntu-24.04`。
 2. **佈建順序**：Vagrant 依定義順序依序佈建（master → worker1 → worker2），Worker 腳本會自動等待 Master 完成。
 3. **VirtualBox Host-only 網路**：VirtualBox 6.1.28+ 預設允許 `192.168.56.0/21` 網段，本指南使用的 IP（192.168.56.10-12）在此範圍內。
 4. **重新佈建**：若需重建叢集，執行 `vagrant destroy -f && vagrant up`。
+
+---
+
+## 常見問題與疑難排解
+
+### 問題一：kubelet 無法啟動（Swap 啟用）
+
+**錯誤訊息：**
+
+```
+failed to run Kubelet: running with swap on is not supported,
+please disable swap or set --fail-swap-on flag to false
+```
+
+**根本原因：**
+
+Kubernetes 的排程器（Scheduler）在決定將 Pod 放到哪個節點時，依賴節點回報的**真實可用記憶體**。當 Swap 啟用時，記憶體使用量變得難以預測：
+
+| 情境 | 無 Swap | 有 Swap |
+|------|---------|---------|
+| 記憶體不足 | OOM Killer 立刻介入，Pod 被終止，K8s 可感知並重排 | 資料悄悄被 swap 到磁碟，Pod 沒死但速度劇降 |
+| 排程決策 | 精確（`request`/`limit` 有意義） | 失真（Node 看起來有記憶體，實際卻在 swap I/O）|
+| 延遲表現 | 可預測 | 磁碟 I/O 造成尖峰延遲，違反 QoS 保證 |
+
+kubelet 在 v1.22+ 預設 `--fail-swap-on=true`，一旦偵測到 `/proc/swaps` 不為空，**直接拒絕啟動**。由於 kube-apiserver、etcd、kube-scheduler 等 Control Plane 元件都是由 kubelet 以 Static Pod 形式管理，kubelet 一旦無法啟動，整個 Control Plane 就跟著無法運作，`kubectl` 連線也會出現「connection refused」。
+
+**封鎖效應示意圖：**
+
+```
+Swap 啟用
+  → kubelet 拒絕啟動（fail-swap-on=true）
+    → Static Pod 無法被管理
+      → kube-apiserver 未啟動
+        → kubectl: connection refused to :6443
+```
+
+**修復方式：**
+
+對所有節點執行（master + worker）：
+
+```bash
+sudo swapoff -a                       # 立即關閉 swap（重開機前有效）
+sudo sed -i '/swap/d' /etc/fstab      # 從 fstab 移除 swap 掛載，確保重開機後不再啟用
+sudo systemctl restart kubelet
+```
+
+使用 Vagrant 時可批次修復：
+
+```bash
+for node in k8s-master k8s-worker1 k8s-worker2; do
+  vagrant ssh $node -c \
+    "sudo swapoff -a && sudo sed -i '/swap/d' /etc/fstab && sudo systemctl restart kubelet"
+done
+```
+
+**驗證：**
+
+```bash
+# Swap 列應全為 0；kubelet 狀態應為 active
+vagrant ssh k8s-master -c "free -h && sudo systemctl is-active kubelet"
+```
+
+---
+
+### 問題二：kubectl 憑證驗證失敗（x509 錯誤）
+
+**錯誤訊息：**
+
+```
+tls: failed to verify certificate: x509: certificate signed by unknown authority
+(possibly because of "crypto/rsa: verification error" while trying to verify
+candidate authority certificate "kubernetes")
+```
+
+**根本原因：**
+
+`~/.kube/config` 儲存的是**某次**從 VM 抓下來的憑證（CA cert + client cert/key）。若 VM 曾被 `vagrant destroy` 再重建，`kubeadm init` 會重新產生一組全新的 PKI，舊憑證就和 API Server 的不吻合：
+
+```
+本機 ~/.kube/config            VM kube-apiserver
+  CA cert（舊）       ≠          CA cert（新，重建後重新簽發）
+  client cert（舊）   ≠          能驗證的 CA（新）
+          ↓
+  x509: certificate signed by unknown authority
+```
+
+**修復方式：**
+
+從 master 的 `/etc/kubernetes/admin.conf` 取得最新憑證，覆蓋本機 kubeconfig：
+
+```bash
+# Step 1：取得最新 admin.conf
+vagrant ssh k8s-master -c "sudo cat /etc/kubernetes/admin.conf" > /tmp/fresh.conf
+
+# Step 2：更新本機 kubeconfig 中的三組憑證資料
+kubectl config set clusters.kubernetes.certificate-authority-data \
+  $(KUBECONFIG=/tmp/fresh.conf kubectl config view --raw \
+    -o jsonpath='{.clusters[0].cluster.certificate-authority-data}')
+
+kubectl config set users.kubernetes-admin.client-certificate-data \
+  $(KUBECONFIG=/tmp/fresh.conf kubectl config view --raw \
+    -o jsonpath='{.users[0].user.client-certificate-data}')
+
+kubectl config set users.kubernetes-admin.client-key-data \
+  $(KUBECONFIG=/tmp/fresh.conf kubectl config view --raw \
+    -o jsonpath='{.users[0].user.client-key-data}')
+
+# Step 3：切換到 Vagrant 叢集 context 並驗證
+kubectl config use-context kubernetes-admin@kubernetes
+kubectl get nodes
+```
+
+或者直接以 fresh.conf 操作，不動 `~/.kube/config`：
+
+```bash
+vagrant ssh k8s-master -c "sudo cat /etc/kubernetes/admin.conf" > /tmp/fresh.conf
+KUBECONFIG=/tmp/fresh.conf kubectl get nodes
+```
+
+---
+
+### 管理多個叢集 Context
+
+本環境同時有 kind 與 Vagrant 兩個叢集，使用 `kubectl config` 在兩者之間切換：
+
+```bash
+# 查看所有 context
+kubectl config get-contexts
+
+# 切換到 Vagrant 3 節點叢集
+kubectl config use-context kubernetes-admin@kubernetes
+
+# 切換回 kind 叢集
+kubectl config use-context kind-presit
+
+# 查看目前使用中的 context
+kubectl config current-context
+```
 
 ---
 
