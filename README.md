@@ -981,7 +981,7 @@ VM 環境（Vagrant、VMware、OpenStack）常有多張網卡。本指南的 Vag
 
 ### 十、需求分析輸出：安裝決策表
 
-需求分析完成後，產出這張表，作為安裝時的唯一依據。右欄「事後可否變更」提醒哪些項目一定要在此刻確定。
+需求分析完成後，產出這張表，作為安裝時的唯一依據。右欄「事後可否變更」提醒哪些項目一定要在此刻確定。各項目在不同規模下的建議選擇與理由，見「進階議題」第五節「設計決策建議」。
 
 以下是**本指南範例環境**的決策表：
 
@@ -4398,6 +4398,1724 @@ CKA/CKAD 考試 ─── 目前仍以 Ingress 為主（Gateway API 尚未列入
 | Ingress 回 `503 Service Unavailable` | 後端 Service 無可用 Endpoints | 檢查 Pod 健康狀態 |
 | Ingress TLS 憑證警告 | Secret 憑證過期或 CN 不符 | 重建 TLS Secret |
 | Headless Service DNS 只回一個 IP | 客戶端 DNS 快取 | 使用 `nslookup` 確認，設定 `ndots` |
+
+---
+
+# 進階議題：性能調優、高可用設計、備份與災難復原
+
+「安裝前需求收集與分析」章節決定了**要不要**做這些事；本章說明**怎麼做**。四個主題彼此相關：調優不當會拖垮 HA、HA 不代表不用備份、備份沒演練過等於沒有災難復原。
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                        叢集韌性金字塔                              │
+│                                                                    │
+│                      ┌────────────┐                                │
+│                      │  災難復原   │  ← 叢集毀了怎麼救回來            │
+│                    ┌─┴────────────┴─┐                              │
+│                    │     備份        │  ← 有東西可以救                │
+│                  ┌─┴────────────────┴─┐                            │
+│                  │     高可用設計       │  ← 單點故障不停機            │
+│                ┌─┴────────────────────┴─┐                          │
+│                │       性能調優           │  ← 在負載下仍然穩定        │
+│              ┌─┴────────────────────────┴─┐                        │
+│              │   正確安裝 + 監控（前面章節）  │                        │
+│              └────────────────────────────┘                        │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+本章所有指令均以本指南的 kubeadm + containerd + Flannel 環境為基礎（Kubernetes 1.32、etcd 3.5）。若只想知道「該怎麼選」，可直接跳到第五節「設計決策建議」。
+
+---
+
+## 一、性能調優
+
+### 1.1 調優的層次
+
+效能問題必須先定位在哪一層，再對症下藥。由下而上：
+
+| 層次 | 常見瓶頸 | 觀察指標 |
+|------|---------|---------|
+| OS / 核心 | 檔案描述符、inotify、conntrack 表滿、CPU 頻率 | `dmesg`、`/proc/sys/*`、`node_exporter` |
+| 容器執行期 | 映像拉取慢、overlayfs 層數過多 | `crictl stats`、拉取時間 |
+| kubelet / 節點 | 資源未保留、Pod 密度過高、驅逐風暴 | `kubectl describe node`、kubelet metrics |
+| etcd | 磁碟 fsync 延遲、DB 過大、碎片化 | `etcd_disk_wal_fsync_duration_seconds` |
+| kube-apiserver | 請求排隊、watch 過多、大 list 請求 | `apiserver_request_duration_seconds`、APF 指標 |
+| 排程 / 控制器 | 排程延遲、控制器 QPS 限制 | `scheduler_scheduling_attempt_duration_seconds` |
+| 網路 | iptables 規則數、DNS 延遲、VXLAN 開銷 | `iperf3`、CoreDNS metrics |
+| 工作負載 | CPU throttling、記憶體 OOM、probe 設定不當 | `container_cpu_cfs_throttled_periods_total` |
+
+> **原則：先量測、再調整、再量測。** 沒有指標的調優是猜測。建議先安裝 `metrics-server` 與 kube-prometheus-stack（見 1.9），再進行以下調整。
+
+### 1.2 OS 與核心層
+
+本指南安裝步驟只設定了最低限度的核心參數（`ip_forward`、`bridge-nf-call-iptables`）。正式環境建議額外調整：
+
+```bash
+sudo tee /etc/sysctl.d/99-k8s-tuning.conf <<'SYSCTL'
+# --- 檔案與 inotify（大量 Pod / 日誌 tail 時必調）---
+fs.file-max = 2097152
+fs.inotify.max_user_instances = 8192
+fs.inotify.max_user_watches = 524288
+fs.aio-max-nr = 1048576
+
+# --- 網路連線 ---
+net.core.somaxconn = 32768
+net.core.netdev_max_backlog = 16384
+net.ipv4.tcp_max_syn_backlog = 8192
+net.ipv4.ip_local_port_range = 10240 65535
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.tcp_keepalive_time = 600
+
+# --- conntrack（kube-proxy iptables/IPVS 模式依賴；表滿會隨機掉封包）---
+net.netfilter.nf_conntrack_max = 1048576
+net.netfilter.nf_conntrack_tcp_timeout_established = 86400
+
+# --- ARP 快取（大型叢集 Pod 數多時，預設 gc_thresh 太小會出現 neighbor table overflow）---
+net.ipv4.neigh.default.gc_thresh1 = 4096
+net.ipv4.neigh.default.gc_thresh2 = 8192
+net.ipv4.neigh.default.gc_thresh3 = 16384
+
+# --- 記憶體 ---
+vm.max_map_count = 262144        # Elasticsearch / 大型 JVM 需要
+vm.swappiness = 0                # Swap 已停用，保險起見
+vm.overcommit_memory = 1
+SYSCTL
+sudo sysctl --system
+```
+
+其他 OS 層設定：
+
+| 項目 | 設定 | 說明 |
+|------|------|------|
+| CPU 頻率調節 | `cpupower frequency-set -g performance` | VM 通常無此選項；實體機必調，避免 `powersave` 造成延遲抖動 |
+| Transparent Huge Pages | `echo never > /sys/kernel/mm/transparent_hugepage/enabled` | 資料庫（MySQL、Redis、MongoDB）官方建議關閉 |
+| 時間同步 | `chrony` 或 `systemd-timesyncd` | 憑證驗證與 etcd 都依賴節點時間一致；漂移 > 幾秒會出現詭異的 TLS 錯誤 |
+| containerd 檔案描述符上限 | 確認 `systemctl show containerd -p LimitNOFILE` 足夠大（≥ 1048576） | 上游 unit 檔預設為 `infinity` |
+| NIC 多佇列 / RSS | `ethtool -L eth1 combined <CPU 數>` | 高流量節點讓多核分擔中斷處理 |
+| irqbalance | `systemctl enable --now irqbalance` | 讓網卡中斷分散到不同 CPU |
+
+### 1.3 etcd 調優
+
+etcd 是整個叢集的效能天花板：**所有** API 寫入都要等 etcd 把 WAL fsync 到磁碟才回應。
+
+#### 磁碟效能是第一優先
+
+安裝前用 `fio` 驗證磁碟是否合格（etcd 官方建議的測試方式）：
+
+```bash
+sudo apt install -y fio
+mkdir -p /var/lib/etcd-fio-test
+fio --rw=write --ioengine=sync --fdatasync=1 \
+    --directory=/var/lib/etcd-fio-test --size=22m --bs=2300 --name=etcd-test
+# 觀察 fsync/fdatasync 的 99th percentile：
+#   99.00th=[ 3000] （單位 usec）→ 3ms ✅ 合格
+#   99.00th=[25000]              → 25ms ❌ 不合格，會頻繁 leader 選舉
+rm -rf /var/lib/etcd-fio-test
+```
+
+| 指標 | 健康門檻 | 超過時的症狀 |
+|------|---------|-------------|
+| `etcd_disk_wal_fsync_duration_seconds` p99 | < 10ms | apiserver 回應變慢、`etcdserver: request timed out` |
+| `etcd_disk_backend_commit_duration_seconds` p99 | < 25ms | 同上 |
+| `etcd_server_leader_changes_seen_total` | 應接近 0 | 頻繁 leader 切換，叢集短暫不可寫 |
+| `etcd_mvcc_db_total_size_in_bytes` | < quota 的 80% | 達到 quota 觸發 `NOSPACE` alarm，**叢集變唯讀** |
+| `etcd_network_peer_round_trip_time_seconds` | < 50ms | 跨區部署延遲過高 |
+
+#### etcd 參數調整
+
+透過 kubeadm 設定檔（`ClusterConfiguration.etcd.local.extraArgs`）或直接編輯 `/etc/kubernetes/manifests/etcd.yaml`：
+
+```yaml
+etcd:
+  local:
+    dataDir: /var/lib/etcd                 # 掛獨立 SSD
+    extraArgs:
+      - name: quota-backend-bytes
+        value: "8589934592"                # 8 GiB（預設 2 GiB；官方建議上限 8 GiB）
+      - name: auto-compaction-mode
+        value: periodic
+      - name: auto-compaction-retention
+        value: "1h"                        # 每小時壓縮歷史版本，控制 DB 成長
+      - name: snapshot-count
+        value: "10000"                     # kubeadm 預設；記憶體充足可調大以減少快照 I/O
+      # 跨區部署（節點間 RTT > 10ms）才需要調整以下兩項，同區保持預設
+      # - name: heartbeat-interval
+      #   value: "250"                     # 預設 100ms
+      # - name: election-timeout
+      #   value: "2500"                    # 預設 1000ms；建議為 heartbeat 的 10 倍
+```
+
+#### 定期維護指令
+
+```bash
+# 設定 etcdctl 環境變數（以下指令共用）
+export ETCDCTL_API=3
+export ETCDCTL_ENDPOINTS=https://127.0.0.1:2379
+export ETCDCTL_CACERT=/etc/kubernetes/pki/etcd/ca.crt
+export ETCDCTL_CERT=/etc/kubernetes/pki/etcd/server.crt
+export ETCDCTL_KEY=/etc/kubernetes/pki/etcd/server.key
+
+# 查看 DB 大小、leader、raft index
+sudo -E etcdctl endpoint status --write-out=table
+
+# 手動壓縮到目前版本（auto-compaction 已啟用時通常不需要）
+REV=$(sudo -E etcdctl endpoint status --write-out=json | jq -r '.[0].Status.header.revision')
+sudo -E etcdctl compact "$REV"
+
+# 碎片整理：釋放壓縮後的空間給 OS。會短暫阻塞該成員，HA 叢集請一次做一台，離峰執行
+sudo -E etcdctl defrag
+
+# 若已觸發 NOSPACE alarm（叢集唯讀），先 compact + defrag，再解除警報
+sudo -E etcdctl alarm list
+sudo -E etcdctl alarm disarm
+```
+
+> **Events 分流：** 大型叢集中 Event 物件佔 etcd 寫入量的大宗。可用獨立 etcd 叢集存放 Events：apiserver 加上 `--etcd-servers-overrides=/events#https://etcd-events-1:2379,https://etcd-events-2:2379`。這是 GKE / EKS 等託管服務的標準做法。
+
+### 1.4 kube-apiserver 調優
+
+| 參數 | 預設 | 調整建議 | 說明 |
+|------|-----|---------|------|
+| `--max-requests-inflight` | 400 | 大型叢集 800–1600 | 唯讀請求同時處理上限 |
+| `--max-mutating-requests-inflight` | 200 | 大型叢集 400–800 | 寫入請求同時處理上限 |
+| API Priority and Fairness（APF） | 啟用 | 保持啟用；為關鍵元件建立 `FlowSchema` | 取代舊的簡單限流，避免單一使用者/控制器塞爆 apiserver |
+| `--event-ttl` | 1h | 保持或縮短 | Event 保留時間，縮短可降低 etcd 壓力 |
+| `--watch-cache-sizes` | 自動 | 通常不調 | 特定資源 watch 量極大時才指定 |
+| `--audit-log-*` | 關閉 | 啟用時搭配精簡 policy | 稽核 `RequestResponse` 等級對所有資源會顯著增加延遲與磁碟寫入 |
+| Static Pod 資源 | CPU request 250m | 正式環境加上 limit 並提高 request | kubeadm 預設無 limit，避免 apiserver 被其他 Pod 擠壓 |
+
+```yaml
+# kubeadm ClusterConfiguration 片段
+apiServer:
+  extraArgs:
+    - name: max-requests-inflight
+      value: "800"
+    - name: max-mutating-requests-inflight
+      value: "400"
+    - name: event-ttl
+      value: "30m"
+```
+
+**用戶端行為對 apiserver 的影響（常被忽略）：**
+
+- 避免 `kubectl get pods -A` 這類**全叢集 list**在監控腳本中高頻執行；改用 `watch` 或 informer。
+- 自訂 Controller / Operator 使用 client-go 時應設定合理的 QPS/Burst，並使用 informer cache 而非直接 GET。
+- 大量 `kubectl exec` / `logs -f` 會佔用 apiserver 連線（流量經 apiserver 轉發到 kubelet）。
+
+觀察指標：
+
+```promql
+# apiserver 請求延遲 p99（依 verb 與資源）
+histogram_quantile(0.99, sum(rate(apiserver_request_duration_seconds_bucket{verb!~"WATCH|CONNECT"}[5m])) by (le, verb, resource))
+
+# APF 排隊 / 拒絕情況
+sum(rate(apiserver_flowcontrol_rejected_requests_total[5m])) by (priority_level, reason)
+```
+
+### 1.5 kube-controller-manager 與 kube-scheduler
+
+| 元件 | 參數 | 預設 | 說明 |
+|------|------|-----|------|
+| 兩者 | `--kube-api-qps` / `--kube-api-burst` | 20 / 30 | 控制器對 apiserver 的請求速率。節點數 > 500 時提高到 100 / 200，否則大量 Pod 變更時控制器會排隊 |
+| KCM | `--concurrent-deployment-syncs` 等 `--concurrent-*` | 5 | 各控制器的平行工作數，Deployment 數量多時可提高 |
+| KCM | `--node-monitor-grace-period` | 40s | kubelet 多久沒回報就標記 NotReady（見 2.6 節點故障時序） |
+| KCM | `--node-cidr-mask-size` | 24 | 每節點 Pod 子網大小（見需求分析 5.2） |
+| Scheduler | `percentageOfNodesToScore` | 自動（50% → 5%） | 大型叢集只對部分節點打分以加速排程；節點 < 100 時等於全部 |
+| Scheduler | 多 Profile / Plugin | — | 可為批次工作負載建立偏好 bin-packing 的 profile（`NodeResourcesFit` 的 `MostAllocated` 策略） |
+
+排程器吞吐量在預設設定下約 **100 Pod/秒**；若有大量 Job 短時間內建立數千 Pod，需要觀察 `scheduler_pending_pods` 是否堆積。
+
+### 1.6 kubelet 與節點層
+
+#### 資源保留與驅逐
+
+正式環境**必須**設定資源保留，否則 Pod 會把 kubelet / containerd / sshd 的資源吃光，造成節點失聯：
+
+```yaml
+# KubeletConfiguration（kubeadm 透過 kubelet-config ConfigMap 統一管理）
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+kubeReserved:
+  cpu: 500m
+  memory: 1Gi
+  ephemeral-storage: 5Gi
+systemReserved:
+  cpu: 500m
+  memory: 512Mi
+  ephemeral-storage: 5Gi
+evictionHard:
+  memory.available: "500Mi"      # 預設 100Mi 太晚，OOM killer 可能先動手
+  nodefs.available: "10%"
+  imagefs.available: "15%"
+  nodefs.inodesFree: "5%"
+evictionSoft:
+  memory.available: "1Gi"
+evictionSoftGracePeriod:
+  memory.available: "1m30s"
+enforceNodeAllocatable: ["pods"]
+```
+
+修改後套用到所有節點：
+
+```bash
+# 編輯叢集層級的 kubelet 設定
+kubectl edit cm kubelet-config -n kube-system
+# 逐節點套用（需 drain）
+sudo kubeadm upgrade node phase kubelet-config && sudo systemctl restart kubelet
+```
+
+#### Pod 密度與拉取效能
+
+| 參數 | 預設 | 建議 | 說明 |
+|------|-----|------|------|
+| `maxPods` | 110 | 依節點規格；大節點（64 核）可 200–250 | 受 Pod 子網 IP 數限制 |
+| `podPidsLimit` | -1（不限） | 4096 | 防止單一 Pod fork bomb 拖垮節點 |
+| `serializeImagePulls` | true | false | 允許平行拉取映像，大幅縮短多 Pod 同時啟動時間 |
+| `maxParallelImagePulls` | 無限制 | 5–10 | 搭配上一項，避免打爆 registry |
+| `registryPullQPS` / `registryBurst` | 5 / 10 | 依 registry 能力 | 對私有 registry 可調高 |
+| `imageGCHighThresholdPercent` / `Low` | 85 / 80 | 磁碟小的節點調低 | 磁碟用量超過 High 時開始清理未使用映像 |
+| `containerLogMaxSize` / `Files` | 10Mi / 5 | 高流量服務調大 | 超過即輪替，舊日誌丟失 |
+| `nodeStatusReportFrequency` | 5m | 保持 | 節點狀態上報間隔，調短會增加 apiserver 壓力 |
+
+#### CPU 綁核與 NUMA（延遲敏感工作負載）
+
+```yaml
+cpuManagerPolicy: static          # Guaranteed QoS 且 CPU 為整數的 Pod 獨占 CPU 核心
+reservedSystemCPUs: "0,1"         # 保留給系統的核心（static policy 必須設定）
+topologyManagerPolicy: single-numa-node   # 確保 CPU、記憶體、裝置在同一 NUMA 節點
+memoryManagerPolicy: Static
+```
+
+適用：資料庫、即時串流、DPDK、AI 推論。一般 Web 服務不需要，且會降低整體利用率。
+
+#### containerd 調優
+
+```toml
+# /etc/containerd/config.toml 片段
+[plugins."io.containerd.grpc.v1.cri"]
+  # 映像拉取平行度（containerd 端）
+  max_concurrent_downloads = 10
+  # Registry 鏡像：離線環境或加速拉取
+  [plugins."io.containerd.grpc.v1.cri".registry]
+    config_path = "/etc/containerd/certs.d"
+
+[plugins."io.containerd.grpc.v1.cri".containerd]
+  # 拉取後丟棄已解壓的 layer 內容，節省磁碟（會使 push/export 變慢）
+  discard_unpacked_layers = true
+```
+
+```bash
+# Registry 鏡像設定範例：docker.io → 私有 Harbor
+sudo mkdir -p /etc/containerd/certs.d/docker.io
+sudo tee /etc/containerd/certs.d/docker.io/hosts.toml <<'TOML'
+server = "https://registry-1.docker.io"
+[host."https://harbor.example.com/v2/dockerhub"]
+  capabilities = ["pull", "resolve"]
+  override_path = true
+TOML
+sudo systemctl restart containerd
+```
+
+其他做法：以 DaemonSet 預先拉取（pre-pull）核心映像、使用 `imagePullPolicy: IfNotPresent`、在 CI 中把基礎映像層數控制在 10 層以內。
+
+### 1.7 網路層調優
+
+#### kube-proxy 模式
+
+| 模式 | 規則複雜度 | 適用規模 | 說明 |
+|------|-----------|---------|------|
+| `iptables`（預設） | O(n)，每個 Service/Endpoint 一組鏈 | < 1,000 Service | Service 數多時，規則同步耗時數秒到數十秒，新 Endpoint 生效延遲 |
+| `ipvs` | O(1) hash 查表 | > 1,000 Service | 支援 rr / lc / sh 等排程演算法；需載入 IPVS 核心模組 |
+| `nftables` | 較 iptables 高效 | 1.31+ beta、1.33 GA | 未來預設；1.32 可測試 |
+| eBPF（Cilium 取代 kube-proxy） | 最高 | 任何規模 | 完全繞過 netfilter，需換 CNI |
+
+切換到 IPVS：
+
+```bash
+# 1. 所有節點載入模組
+cat <<'MOD' | sudo tee /etc/modules-load.d/ipvs.conf
+ip_vs
+ip_vs_rr
+ip_vs_wrr
+ip_vs_sh
+nf_conntrack
+MOD
+sudo modprobe ip_vs ip_vs_rr ip_vs_wrr ip_vs_sh nf_conntrack
+sudo apt install -y ipvsadm ipset
+
+# 2. 修改 kube-proxy 設定
+kubectl edit cm kube-proxy -n kube-system
+#   mode: "ipvs"
+#   ipvs:
+#     scheduler: "rr"
+#     strictARP: true        # MetalLB L2 模式需要
+
+# 3. 重啟 kube-proxy
+kubectl rollout restart ds kube-proxy -n kube-system
+
+# 4. 驗證
+sudo ipvsadm -Ln | head -20
+kubectl logs -n kube-system -l k8s-app=kube-proxy | grep -i "Using ipvs Proxier"
+```
+
+#### conntrack
+
+kube-proxy 會依 CPU 數自動設定 `nf_conntrack_max`（`conntrack.maxPerCore: 32768`，最低 `min: 131072`）。高連線數節點（API Gateway、Ingress）可提高：
+
+```yaml
+# kube-proxy ConfigMap
+conntrack:
+  maxPerCore: 65536
+  min: 524288
+  tcpEstablishedTimeout: 24h0m0s
+  tcpCloseWaitTimeout: 1h0m0s
+```
+
+表滿的症狀：`dmesg` 出現 `nf_conntrack: table full, dropping packet`，連線隨機失敗。
+
+#### DNS 效能
+
+DNS 是 Kubernetes 網路最常見的效能瓶頸，因為 **每個 Pod 的每次外部連線都可能先發 5 次 DNS 查詢**：
+
+```
+Pod 內 /etc/resolv.conf：
+  search default.svc.cluster.local svc.cluster.local cluster.local
+  options ndots:5
+
+查詢 api.example.com（點數 2 < ndots 5）→ 依序嘗試：
+  api.example.com.default.svc.cluster.local   ← NXDOMAIN
+  api.example.com.svc.cluster.local           ← NXDOMAIN
+  api.example.com.cluster.local               ← NXDOMAIN
+  api.example.com                             ← 成功
+（每次都是 A + AAAA 兩個查詢，共 8 次往返）
+```
+
+| 對策 | 做法 | 效果 |
+|------|------|------|
+| **NodeLocal DNSCache** | 每節點跑一個 DNS 快取 DaemonSet（監聽 169.254.20.10），Pod 先問本機 | 消除跨節點 DNS 流量與 conntrack 競爭，官方推薦 |
+| 調整 `ndots` | Pod spec 加 `dnsConfig.options: [{name: ndots, value: "2"}]` | 外部網域直接查詢，少 6 次往返 |
+| 使用 FQDN | 程式碼中寫 `api.example.com.`（結尾加點） | 跳過 search list |
+| CoreDNS 擴容 | `cluster-proportional-autoscaler` 依節點數自動調整副本 | 預設 2 副本在大叢集不夠 |
+| CoreDNS cache | Corefile 中 `cache 30` 已預設啟用；可調整 TTL | 減少上游查詢 |
+
+```bash
+# 安裝 NodeLocal DNSCache
+KUBEDNS=$(kubectl get svc kube-dns -n kube-system -o jsonpath='{.spec.clusterIP}')
+curl -sLO https://raw.githubusercontent.com/kubernetes/kubernetes/master/cluster/addons/dns/nodelocaldns/nodelocaldns.yaml
+sed -i "s/__PILLAR__LOCAL__DNS__/169.254.20.10/g; s/__PILLAR__DNS__DOMAIN__/cluster.local/g; s/__PILLAR__DNS__SERVER__/$KUBEDNS/g" nodelocaldns.yaml
+kubectl apply -f nodelocaldns.yaml
+# 之後需將 kubelet clusterDNS 改指向 169.254.20.10（iptables 模式的 kube-proxy 可不改，NodeLocal 會攔截）
+```
+
+#### CNI 與封裝開銷
+
+| 模式 | 每封包額外開銷 | 相對吞吐 | 條件 |
+|------|--------------|---------|------|
+| Flannel VXLAN（本指南） | 50 bytes 封裝 + 核心處理 | 基準 100% | 任何 L3 網路 |
+| Flannel host-gw | 無封裝 | ~110–120% | 所有節點在**同一 L2 網段** |
+| Calico BGP / Cilium native routing | 無封裝 | ~110–120% | 同上，或路由器支援 BGP |
+| Cilium eBPF + XDP | 無封裝 + 繞過 netfilter | ~120–130% | 核心 ≥ 5.10 |
+| Jumbo Frame（MTU 9000） | 封裝比例降低 | 大檔案傳輸顯著提升 | 整條路徑（交換器、NIC）都支援 |
+
+本指南的 Vagrant 環境節點都在 `192.168.56.0/24` 同一 L2，可將 Flannel 改為 host-gw 模式測試差異：
+
+```bash
+kubectl edit cm kube-flannel-cfg -n kube-flannel
+#   net-conf.json: "Backend": {"Type": "host-gw"}
+kubectl rollout restart ds kube-flannel-ds -n kube-flannel
+ip route | grep 10.244   # 應變成 via 192.168.56.x dev eth1（不再經過 flannel.1）
+```
+
+用 `iperf3` 量測 Pod 間頻寬：
+
+```bash
+kubectl run iperf-server --image=networkstatic/iperf3 --port=5201 -- -s
+kubectl wait --for=condition=Ready pod/iperf-server
+SERVER_IP=$(kubectl get pod iperf-server -o jsonpath='{.status.podIP}')
+# 用 nodeSelector 確保 client 在不同節點
+kubectl run iperf-client --rm -it --image=networkstatic/iperf3 \
+  --overrides='{"spec":{"nodeSelector":{"kubernetes.io/hostname":"k8s-worker2"}}}' \
+  -- -c $SERVER_IP -t 10
+kubectl delete pod iperf-server
+```
+
+### 1.8 工作負載層
+
+#### requests / limits 的正確設定
+
+```
+CPU：
+  request  → 排程依據 + cgroup cpu.shares（保證最低比例）
+  limit    → cgroup CFS quota（每 100ms 週期最多用多少）
+             ⚠ 即使節點 CPU 閒置，超過 limit 仍會被 throttle → 延遲飆高
+
+記憶體：
+  request  → 排程依據
+  limit    → cgroup memory.max，超過直接 OOMKilled
+```
+
+| 建議 | 理由 |
+|------|------|
+| **所有 Pod 都設 request** | 沒 request 的 Pod（BestEffort）會被排程器塞滿節點，最先被驅逐 |
+| **記憶體 request = limit** | 記憶體無法壓縮；不相等時節點超賣，OOM 時殺誰難以預測 |
+| **CPU 慎設 limit，或 limit 設為 request 的 2–4 倍** | CFS throttling 是延遲敏感服務最常見的效能殺手；Guaranteed QoS 需要 request = limit，但多數服務不需要 Guaranteed |
+| 用 **LimitRange** 設定 namespace 預設值 | 防止開發者忘記設定 |
+| 用 **VPA**（recommendation 模式）找出合理值 | 比猜測準確 |
+
+觀察 throttling：
+
+```promql
+# 每個容器被 throttle 的週期比例；> 25% 就該提高 limit 或移除
+sum(rate(container_cpu_cfs_throttled_periods_total[5m])) by (namespace, pod, container)
+  / sum(rate(container_cpu_cfs_periods_total[5m])) by (namespace, pod, container)
+```
+
+#### QoS 與 PriorityClass
+
+| QoS | 條件 | 節點壓力時的驅逐順序 |
+|-----|------|-------------------|
+| Guaranteed | 所有容器 request = limit（CPU 與記憶體） | 最後 |
+| Burstable | 至少一個容器有 request，但不滿足 Guaranteed | 中間（超出 request 越多越先） |
+| BestEffort | 完全沒設 | 最先 |
+
+搭配 `PriorityClass` 讓關鍵服務在資源不足時**搶佔**低優先 Pod：
+
+```yaml
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: business-critical
+value: 1000000
+globalDefault: false
+description: "核心交易服務"
+---
+# Pod spec 中加上
+#   priorityClassName: business-critical
+```
+
+#### Probe 設定
+
+| Probe | 常見錯誤 | 建議 |
+|-------|---------|------|
+| liveness | 檢查外部依賴（DB）→ DB 慢時全部 Pod 被重啟，雪崩 | 只檢查程序本身是否卡死 |
+| readiness | `initialDelaySeconds` 太短 → 未就緒就收流量 | 改用 `startupProbe` 處理慢啟動 |
+| 全部 | `timeoutSeconds: 1`（預設）→ GC 停頓就失敗 | 3–5 秒 |
+
+#### 自動擴縮
+
+- **HPA**：以 CPU/記憶體或自訂指標（Prometheus Adapter / KEDA）擴縮副本；設定 `behavior` 避免抖動。
+- **VPA**：調整 request/limit；不要與 HPA 同時對 CPU 作用。
+- **Cluster Autoscaler / Karpenter**：雲端環境自動加減節點；地端可用 Cluster API 或手動。
+
+### 1.9 效能監控與基準測試
+
+#### 必裝元件
+
+```bash
+# metrics-server（kubectl top、HPA 依賴）
+kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+# 自簽憑證環境（本指南 Vagrant）需加 --kubelet-insecure-tls
+kubectl patch deploy metrics-server -n kube-system --type=json \
+  -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]'
+
+# kube-prometheus-stack（Prometheus + Grafana + Alertmanager + 預設儀表板與告警規則）
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+helm install kps prometheus-community/kube-prometheus-stack -n monitoring --create-namespace \
+  --set prometheus.prometheusSpec.retention=15d \
+  --set prometheus.prometheusSpec.storageSpec.volumeClaimTemplate.spec.resources.requests.storage=50Gi
+```
+
+#### 關鍵 SLI
+
+| 層 | 指標 | 目標 |
+|----|------|------|
+| apiserver | 非 watch 請求 p99 延遲 | < 1s（list）/ < 0.1s（get） |
+| etcd | WAL fsync p99 | < 10ms |
+| scheduler | `scheduler_scheduling_attempt_duration_seconds` p99 | < 1s |
+| Pod 啟動 | 從建立到 Running（不含拉取映像） | < 5s |
+| DNS | CoreDNS `coredns_dns_request_duration_seconds` p99 | < 10ms |
+| 節點 | CPU / 記憶體 request 佔比 | < 80%（留餘裕給故障轉移） |
+
+#### 基準測試工具
+
+| 工具 | 用途 |
+|------|------|
+| `kube-burner` | 大規模建立 Pod/Deployment，量測 apiserver 與排程吞吐 |
+| `clusterloader2` | Kubernetes 官方的可擴展性測試框架 |
+| `sonobuoy` | Conformance 測試，確認叢集行為符合上游 |
+| `fio` | 磁碟（etcd、PV） |
+| `iperf3` | Pod / 節點間網路頻寬 |
+| `k6` / `wrk` | 應用層 HTTP 負載 |
+| `dnsperf` | DNS 查詢吞吐 |
+
+---
+
+## 二、高可用設計
+
+需求分析章節第四節說明了 HA 拓撲的**選擇**；本節說明**如何建置**，以及 Control Plane 之外常被忽略的 HA 層面。
+
+### 2.1 HA 的六個層次
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ 6. 跨站點 / 多叢集      DNS 故障轉移、GitOps 同步、資料複製          │
+├─────────────────────────────────────────────────────────────────┤
+│ 5. 儲存                 多副本 (Longhorn/Ceph)、DB 自身複製          │
+├─────────────────────────────────────────────────────────────────┤
+│ 4. 入口與 DNS           Ingress 多副本、MetalLB/BGP、CoreDNS 反親和   │
+├─────────────────────────────────────────────────────────────────┤
+│ 3. 工作負載             多副本、反親和、PDB、優雅關閉                │
+├─────────────────────────────────────────────────────────────────┤
+│ 2. etcd                 3/5 成員、獨立磁碟、跨故障域                │
+├─────────────────────────────────────────────────────────────────┤
+│ 1. Control Plane        3 apiserver + LB/VIP、Leader Election      │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**只做第 1、2 層是最常見的錯誤**：Control Plane 全活著，但 Ingress Controller 只有一個副本掛在故障的節點上，使用者一樣看到 502。
+
+### 2.2 Stacked etcd HA 建置（kubeadm）
+
+以下以 3 Control Plane + 2 Worker 為例，沿用本指南的 Host-only 網段：
+
+| 角色 | 主機名稱 | IP |
+|------|---------|-----|
+| VIP（apiserver 入口） | `k8s-api` | 192.168.56.100 |
+| Control Plane 1 | k8s-cp1 | 192.168.56.10 |
+| Control Plane 2 | k8s-cp2 | 192.168.56.11 |
+| Control Plane 3 | k8s-cp3 | 192.168.56.12 |
+| Worker | k8s-worker1/2 | 192.168.56.21 / 22 |
+
+```
+                     kubectl / Worker kubelet
+                              │
+                              ▼
+                   VIP 192.168.56.100:6443
+                   (kube-vip 或 keepalived+HAProxy)
+                    ┌─────────┼─────────┐
+                    ▼         ▼         ▼
+               ┌────────┐┌────────┐┌────────┐
+               │  cp1   ││  cp2   ││  cp3   │
+               │ api    ││ api    ││ api    │  ← 三個 apiserver 同時服務（無狀態）
+               │ etcd ◄─┼┼─etcd ◄─┼┼─etcd   │  ← Raft：一個 leader，兩個 follower
+               │ sched  ││ sched  ││ sched  │  ← Leader Election：只有一個 active
+               │ ctrl   ││ ctrl   ││ ctrl   │  ← 同上
+               └────────┘└────────┘└────────┘
+```
+
+#### 步驟 1：所有節點完成共同設定
+
+執行方法二「一、所有節點共同設定」的全部步驟（Swap、核心模組、containerd、kubeadm）。
+
+#### 步驟 2：建立 VIP — 方案 A：kube-vip（推薦，無需額外機器）
+
+在 **cp1** 執行：
+
+```bash
+export VIP=192.168.56.100
+export INTERFACE=eth1
+export KVVERSION=v0.8.9   # 請至 https://github.com/kube-vip/kube-vip/releases 確認最新版
+
+# 以 containerd 直接跑 kube-vip 產生 static Pod manifest
+sudo ctr image pull ghcr.io/kube-vip/kube-vip:$KVVERSION
+sudo ctr run --rm --net-host ghcr.io/kube-vip/kube-vip:$KVVERSION vip \
+  /kube-vip manifest pod \
+    --interface $INTERFACE \
+    --address $VIP \
+    --controlplane \
+    --arp \
+    --leaderElection | sudo tee /etc/kubernetes/manifests/kube-vip.yaml
+```
+
+> **Kubernetes 1.29+ 的雞生蛋問題：** `kubeadm init` 期間 `admin.conf` 尚無 cluster-admin 權限，kube-vip 會無法做 leader election，導致 VIP 起不來、init 卡住。解法：在第一台 init **之前**把 manifest 中的 `/etc/kubernetes/admin.conf` 改為 `/etc/kubernetes/super-admin.conf`，init 完成後再改回來：
+>
+> ```bash
+> sudo sed -i 's#path: /etc/kubernetes/admin.conf#path: /etc/kubernetes/super-admin.conf#' /etc/kubernetes/manifests/kube-vip.yaml
+> # ... kubeadm init 完成後 ...
+> sudo sed -i 's#path: /etc/kubernetes/super-admin.conf#path: /etc/kubernetes/admin.conf#' /etc/kubernetes/manifests/kube-vip.yaml
+> ```
+
+#### 步驟 2：建立 VIP — 方案 B：HAProxy + keepalived（傳統做法）
+
+在**每台 Control Plane** 安裝：
+
+```bash
+sudo apt install -y haproxy keepalived
+```
+
+```
+# /etc/haproxy/haproxy.cfg
+frontend k8s-api
+    bind *:8443                      # 用 8443 避免與本機 apiserver 的 6443 衝突
+    mode tcp
+    default_backend k8s-api-backend
+
+backend k8s-api-backend
+    mode tcp
+    balance roundrobin
+    option httpchk GET /healthz
+    http-check expect status 200
+    default-server inter 3s fall 3 rise 2 check check-ssl verify none
+    server cp1 192.168.56.10:6443
+    server cp2 192.168.56.11:6443
+    server cp3 192.168.56.12:6443
+```
+
+```
+# /etc/keepalived/keepalived.conf（cp1 為 MASTER priority 101，其餘 BACKUP priority 100）
+vrrp_script check_haproxy {
+    script "/usr/bin/killall -0 haproxy"
+    interval 2
+    weight -20
+}
+vrrp_instance VI_1 {
+    state MASTER
+    interface eth1
+    virtual_router_id 51
+    priority 101
+    advert_int 1
+    authentication {
+        auth_type PASS
+        auth_pass k8s-vip
+    }
+    virtual_ipaddress {
+        192.168.56.100/24
+    }
+    track_script {
+        check_haproxy
+    }
+}
+```
+
+```bash
+sudo systemctl enable --now haproxy keepalived
+ip addr show eth1 | grep 192.168.56.100   # 只在 MASTER 上看到 VIP
+```
+
+此方案的 `--control-plane-endpoint` 為 `192.168.56.100:8443`。
+
+#### 步驟 3：初始化第一台 Control Plane
+
+```bash
+# cp1
+sudo kubeadm init \
+  --control-plane-endpoint "192.168.56.100:6443" \
+  --apiserver-advertise-address 192.168.56.10 \
+  --pod-network-cidr 10.244.0.0/16 \
+  --upload-certs
+
+# 輸出會有兩段 join 指令，務必保存：
+#   (a) 加入 Control Plane：kubeadm join 192.168.56.100:6443 --token ... \
+#         --discovery-token-ca-cert-hash sha256:... \
+#         --control-plane --certificate-key <64 hex>
+#   (b) 加入 Worker：kubeadm join 192.168.56.100:6443 --token ... \
+#         --discovery-token-ca-cert-hash sha256:...
+```
+
+`--upload-certs` 會把 PKI 憑證加密後存入 Secret `kubeadm-certs`，供其他 Control Plane 下載；**`certificate-key` 兩小時後失效**，過期後重新產生：
+
+```bash
+sudo kubeadm init phase upload-certs --upload-certs
+```
+
+接著設定 kubectl、部署 Flannel（同方法二步驟；Flannel 的 `--iface=eth1` 設定不變）。
+
+#### 步驟 4：加入其他 Control Plane
+
+```bash
+# cp2、cp3（先在每台複製 kube-vip manifest 或設好 HAProxy/keepalived）
+sudo kubeadm join 192.168.56.100:6443 \
+  --token <token> \
+  --discovery-token-ca-cert-hash sha256:<hash> \
+  --control-plane \
+  --certificate-key <key> \
+  --apiserver-advertise-address 192.168.56.11    # cp3 改為 .12
+```
+
+kubeadm 會自動：下載憑證 → 產生本機 apiserver / etcd 憑證 → 以 `etcdctl member add` 加入 etcd 叢集 → 啟動 static Pod。
+
+#### 步驟 5：驗證
+
+```bash
+kubectl get nodes -o wide
+kubectl get pods -n kube-system -o wide | grep -E "etcd|apiserver|kube-vip"
+
+# etcd 成員與健康狀態（在任一 cp 執行，使用 1.3 節的環境變數）
+sudo -E etcdctl member list --write-out=table
+sudo -E etcdctl endpoint health --cluster --write-out=table
+
+# 故障轉移測試：關掉 cp1，VIP 應在數秒內漂移，kubectl 持續可用
+vagrant halt k8s-cp1        # 或 sudo systemctl stop kubelet && sudo systemctl stop containerd
+watch kubectl get nodes
+```
+
+### 2.3 External etcd 拓撲要點
+
+與 Stacked 的差異只在 etcd 獨立部署：
+
+1. 在 3 台 etcd 節點上以 kubeadm 產生憑證並用 static Pod 跑 etcd（官方文件「Set up a High Availability etcd cluster with kubeadm」）。
+2. 把 etcd 的 `ca.crt`、`apiserver-etcd-client.crt/key` 複製到第一台 Control Plane。
+3. `kubeadm init --config` 中指定：
+
+```yaml
+etcd:
+  external:
+    endpoints:
+      - https://192.168.56.31:2379
+      - https://192.168.56.32:2379
+      - https://192.168.56.33:2379
+    caFile: /etc/kubernetes/pki/etcd/ca.crt
+    certFile: /etc/kubernetes/pki/apiserver-etcd-client.crt
+    keyFile: /etc/kubernetes/pki/apiserver-etcd-client.key
+```
+
+適用時機：Control Plane 節點資源緊張、需要獨立擴縮 etcd、或安全政策要求 etcd 與 apiserver 隔離。代價是機器數加倍、維運面加寬。
+
+### 2.4 Control Plane 元件的 HA 機制
+
+| 元件 | 機制 | 說明 |
+|------|------|------|
+| kube-apiserver | 無狀態、多活 | 所有實例同時服務，由 LB 分流；任一掛掉 LB 健康檢查踢除 |
+| etcd | Raft 共識 | 一個 leader，寫入需過半確認；leader 掛掉約 1–2 秒內重選 |
+| kube-scheduler | Leader Election（Lease 物件） | 多實例只有一個 active，其餘 standby；切換約 15 秒（`leaseDuration`） |
+| kube-controller-manager | 同上 | 同上 |
+| CoreDNS | Deployment 多副本 | 見 2.7 |
+| kube-proxy / CNI | DaemonSet | 每節點各自獨立，無單點 |
+
+```bash
+# 查看目前 leader
+kubectl get lease -n kube-system kube-scheduler kube-controller-manager
+```
+
+### 2.5 工作負載 HA
+
+Control Plane 掛掉時**既有 Pod 不受影響**（kubelet 與 containerd 獨立運作），但無法建立新 Pod 或故障轉移。反過來說，工作負載的 HA 主要靠以下設計，與 Control Plane 是否 HA 無關：
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  replicas: 3                                   # ① 至少 2，建議 3（滾動更新時仍有 2 個）
+  strategy:
+    rollingUpdate:
+      maxUnavailable: 0                         # ② 更新期間不減少可用副本
+      maxSurge: 1
+  template:
+    spec:
+      priorityClassName: business-critical      # ③ 資源不足時優先保留
+      topologySpreadConstraints:                # ④ 平均分散到不同節點 / 可用區
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels: { app: web }
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: { app: web }
+      terminationGracePeriodSeconds: 60         # ⑤ 給應用時間處理完在途請求
+      containers:
+        - name: web
+          image: myapp:1.0
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sh", "-c", "sleep 5"]  # ⑥ 等 Endpoint 移除傳播到所有 kube-proxy 再關閉
+          readinessProbe:                       # ⑦ 未就緒不收流量
+            httpGet: { path: /ready, port: 8080 }
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 250m, memory: 256Mi }
+            limits: { memory: 256Mi }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget                       # ⑧ drain / 升級時保證最低可用數
+metadata:
+  name: web-pdb
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels: { app: web }
+```
+
+> **為什麼要 `preStop sleep`？** Pod 被刪除時，「從 Endpoints 移除」與「送 SIGTERM 給容器」是**平行**發生的。kube-proxy 更新 iptables 需要幾秒，這段時間新連線仍會被送到正在關閉的 Pod。sleep 幾秒讓規則先更新完，是零停機滾動更新的關鍵細節。
+
+**StatefulSet 的額外考量：** Pod 有身分（`web-0`），節點失聯時 Kubernetes **不會**自動在其他節點重建（避免腦裂造成兩個 `web-0` 同時寫同一份資料）。需要 (a) 確認節點確實死亡後手動 `kubectl delete pod web-0 --force`，或 (b) 部署節點隔離（fencing）機制，或 (c) 使用 Operator（如 CloudNativePG、Strimzi）處理故障轉移。
+
+### 2.6 節點故障處理時序
+
+理解預設時序，才能判斷「多久會自動恢復」與「要不要調快」：
+
+```
+T+0s     節點斷電 / 網路中斷
+T+10s    kubelet 停止更新 Node Lease（正常每 10s 一次）
+T+40s    kube-controller-manager 判定 NotReady（node-monitor-grace-period）
+         → 自動加上 taint：node.kubernetes.io/unreachable:NoExecute
+T+40s    Deployment 的 Pod 開始倒數 tolerationSeconds（預設 300s）
+T+340s   Pod 被驅逐（狀態變 Terminating），ReplicaSet 在其他節點建新 Pod
+T+340s + 映像拉取 + 啟動時間 → 服務恢復
+
+StatefulSet Pod：停在 Terminating，不會自動重建（見 2.5）
+使用 RWO PV 的 Pod：新 Pod 卡在 ContainerCreating，等原節點的 VolumeAttachment 逾時（約 6 分鐘）
+```
+
+**加速方式**（對延遲敏感的服務）：
+
+```yaml
+# Pod spec：把 300s 縮短到 30s
+tolerations:
+  - key: node.kubernetes.io/unreachable
+    operator: Exists
+    effect: NoExecute
+    tolerationSeconds: 30
+  - key: node.kubernetes.io/not-ready
+    operator: Exists
+    effect: NoExecute
+    tolerationSeconds: 30
+```
+
+或全域調整 KCM 的 `--node-monitor-grace-period`（不建議低於 20s，網路抖動會造成誤判）。
+
+**優雅關機（計畫性維護）：** 啟用 kubelet Graceful Node Shutdown，讓節點收到關機訊號時先依序終止 Pod：
+
+```yaml
+# KubeletConfiguration
+shutdownGracePeriod: 60s
+shutdownGracePeriodCriticalPods: 20s
+```
+
+計畫性維護仍應先 `kubectl drain`（見 CKA-Q4）。
+
+### 2.7 入口與 DNS 的 HA
+
+| 元件 | 預設狀態 | HA 做法 |
+|------|---------|--------|
+| CoreDNS | 2 副本，**可能在同一節點** | 加 `podAntiAffinity`（`kubectl edit deploy coredns -n kube-system`），或改為 DaemonSet；搭配 NodeLocal DNSCache |
+| Ingress Controller | 1 副本（多數 Helm chart 預設） | ≥ 2 副本 + 反親和 + PDB，或以 DaemonSet 跑在專用 ingress 節點 |
+| MetalLB L2 模式 | 單一節點回應 ARP | 節點掛掉時由其他 speaker 接手（約 10 秒，依 memberlist 偵測）；流量集中在一個節點，非真正負載平衡 |
+| MetalLB BGP 模式 | 多節點同時宣告 | 路由器 ECMP 分流，故障轉移取決於 BGP timer（可調至秒級） |
+| 外部 DNS | — | 對外網域使用多 A 記錄或 GSLB；TTL 縮短到 60s 以內加快切換 |
+
+```bash
+# CoreDNS 反親和 patch
+kubectl patch deploy coredns -n kube-system --type=merge -p '{
+  "spec": {"template": {"spec": {"affinity": {"podAntiAffinity": {
+    "requiredDuringSchedulingIgnoredDuringExecution": [{
+      "labelSelector": {"matchLabels": {"k8s-app": "kube-dns"}},
+      "topologyKey": "kubernetes.io/hostname"}]}}}}}}'
+```
+
+### 2.8 儲存 HA
+
+| 情境 | 問題 | 對策 |
+|------|------|------|
+| RWO 磁碟（雲端 EBS/PD、iSCSI） | 節點失聯時磁碟仍附掛在舊節點，新 Pod 無法掛載 | 接受約 6 分鐘的 detach 逾時；或使用節點 fencing；或改用複製型儲存 |
+| 單副本儲存（NFS 單機、hostPath） | 儲存節點本身是單點 | NFS 用 DRBD / 儲存設備的 HA；或改 Longhorn / Ceph |
+| Longhorn | — | 每個 Volume 預設 3 副本分散在不同節點，節點掛掉自動用其他副本；設定 `replica-zone-soft-anti-affinity` 跨區 |
+| Rook-Ceph | — | CRUSH map 依故障域（host / rack / zone）分散資料；OSD ≥ 3 節點 |
+| 資料庫 | 儲存層 HA ≠ 資料庫 HA | 用資料庫自身複製（PostgreSQL streaming replication、MySQL Group Replication）+ Operator 處理 failover，儲存層只需 RWO |
+
+### 2.9 多可用區與多叢集
+
+#### 單叢集跨可用區
+
+- 節點打上 `topology.kubernetes.io/zone` 標籤（雲端自動；地端手動）。
+- **Control Plane 需 3 個區**：2 個區的話，一區失聯時 etcd 可能失去 quorum（3 成員配置 2+1，失去 2 那區就掛）。
+- etcd 成員間 RTT 應 **< 10ms**；跨城市（> 30ms）不建議單叢集跨區，改用多叢集。
+- 工作負載用 `topologySpreadConstraints` 跨區分散（見 2.5）。
+- 儲存需支援跨區（雲端 regional disk；Longhorn zone anti-affinity）。
+
+#### 多叢集
+
+```
+                    ┌─────────────────────────┐
+                    │  Global LB / DNS (GSLB)  │
+                    │  健康檢查 + 權重 / 就近    │
+                    └─────┬──────────────┬─────┘
+                          │              │
+              ┌───────────▼──┐     ┌─────▼────────┐
+              │ 叢集 A（台北）│     │ 叢集 B（高雄） │
+              │ 完整 Control │     │ 完整 Control  │
+              │ Plane + 工作 │     │ Plane + 工作  │
+              └───────┬──────┘     └──────┬───────┘
+                      │                   │
+                      └──── GitOps ───────┘   ← 同一份 Git 定義同步部署到兩邊
+                      └──── 資料複製 ─────┘   ← DB 跨叢集複製 / 物件儲存跨區複製
+```
+
+| 模式 | 說明 | 適用 |
+|------|------|------|
+| Active-Passive | B 叢集平時閒置或只跑低優先工作，A 掛掉時 DNS 切換 | RTO 分鐘級可接受、成本敏感 |
+| Active-Active | 兩邊同時服務，GSLB 分流 | 需要秒級 RTO；資料層需支援多主或明確分區 |
+| 叢集聯邦（Karmada、Liqo、Cluster API） | 統一管理多叢集的部署與排程 | 叢集數 > 3 |
+
+**多叢集的關鍵不是 Kubernetes，而是資料。** 無狀態服務靠 GitOps 就能兩邊一致；有狀態服務需要資料庫層級的跨站複製與明確的切換程序。
+
+### 2.10 HA 檢核表
+
+安裝完成後逐項確認：
+
+- [ ] `--control-plane-endpoint` 指向 VIP / DNS，而非單一節點 IP
+- [ ] 3 個 Control Plane 分散在不同實體主機 / 機櫃 / 可用區
+- [ ] etcd 使用獨立 SSD；`etcdctl endpoint health --cluster` 全部 healthy
+- [ ] 關閉任一 Control Plane，`kubectl get nodes` 仍可用（VIP 漂移 < 10 秒）
+- [ ] CoreDNS ≥ 2 副本且在不同節點
+- [ ] Ingress Controller ≥ 2 副本且在不同節點，有 PDB
+- [ ] 所有正式服務 `replicas ≥ 2`、有 `topologySpreadConstraints` 或反親和、有 PDB、有 readinessProbe
+- [ ] 關鍵服務有 `PriorityClass`
+- [ ] StatefulSet 有明確的節點故障處理程序（手動或 Operator）
+- [ ] 儲存層有副本或後端 HA
+- [ ] 節點資源 request 總和 < 80%，確保 N+1 容量
+- [ ] 已實際演練：拔一台 Worker、拔一台 Control Plane、拔儲存節點
+
+---
+
+## 三、備份
+
+HA 保護的是**硬體故障**；備份保護的是**邏輯錯誤**（誤刪、錯誤設定、勒索軟體、升級失敗）。HA 叢集會忠實地把 `kubectl delete ns production` 複製到三個 etcd 成員。
+
+### 3.1 要備份什麼
+
+| 層 | 內容 | 位置 | 備份方式 | 重要性 |
+|----|------|------|---------|-------|
+| **叢集狀態** | 所有 Kubernetes 物件（Deployment、Secret、ConfigMap、RBAC…） | etcd | `etcdctl snapshot save` | ★★★ |
+| **PKI 憑證** | CA、apiserver、etcd、front-proxy 憑證與金鑰 | `/etc/kubernetes/pki/` | tar 打包（**含私鑰，需加密存放**） | ★★★ 遺失 CA = 所有節點需重新加入 |
+| **kubeadm 設定** | 初始化參數 | `kubeadm-config` ConfigMap（在 etcd 內）+ 原始 `kubeadm-config.yaml` | Git | ★★★ |
+| **Static Pod manifests** | apiserver / etcd / scheduler / KCM 的啟動參數 | `/etc/kubernetes/manifests/` | tar | ★★ 可由 kubeadm 重新產生，但手動修改（audit、encryption）會遺失 |
+| **加密設定** | `EncryptionConfiguration`、audit policy | `/etc/kubernetes/enc/`、`/etc/kubernetes/audit/` | tar（**加密金鑰遺失 = Secret 永久無法解密**） | ★★★ |
+| **CNI 設定** | Flannel / Calico 設定 | 在 etcd 內（ConfigMap）+ `/etc/cni/net.d/` | 隨 etcd | ★ |
+| **應用資料** | 資料庫、上傳檔案 | PV | Velero + CSI Snapshot / 應用層 dump | ★★★ |
+| **映像檔** | 私有 registry 內容 | Harbor / registry 儲存 | registry 自身的複製 / 儲存快照 | ★★ |
+| **宣告式來源** | 所有 YAML / Helm values | Git | Git 本身的備份（GitHub / GitLab） | ★★★ 最終真相來源 |
+
+> **etcd 快照包含 Secret 明文**（除非啟用靜態加密）。備份檔的存取控制等同於 cluster-admin 權限。
+
+### 3.2 etcd 備份
+
+CKA-Q5 示範了手動備份指令；正式環境需要**自動化、驗證、異地存放、保留策略**四件事。
+
+#### 備份腳本
+
+```bash
+sudo tee /usr/local/bin/etcd-backup.sh <<'SCRIPT'
+#!/usr/bin/env bash
+set -euo pipefail
+
+BACKUP_DIR=/var/backups/etcd
+RETENTION_DAYS=14
+REMOTE=s3://my-bucket/etcd-backups/$(hostname)   # 或 NFS 路徑、rsync 目標
+TS=$(date +%Y%m%d-%H%M%S)
+SNAP=$BACKUP_DIR/etcd-$TS.db
+
+export ETCDCTL_API=3
+export ETCDCTL_ENDPOINTS=https://127.0.0.1:2379
+export ETCDCTL_CACERT=/etc/kubernetes/pki/etcd/ca.crt
+export ETCDCTL_CERT=/etc/kubernetes/pki/etcd/server.crt
+export ETCDCTL_KEY=/etc/kubernetes/pki/etcd/server.key
+
+mkdir -p "$BACKUP_DIR"
+
+# 1. 快照
+etcdctl snapshot save "$SNAP"
+
+# 2. 驗證：能讀出 hash / revision / key 數代表檔案完整
+etcdctl snapshot status "$SNAP" --write-out=table
+
+# 3. 一併備份 PKI 與 manifests（加密：金鑰只放在備份主機）
+tar -czf "$BACKUP_DIR/k8s-config-$TS.tar.gz" \
+    /etc/kubernetes/pki /etc/kubernetes/manifests \
+    /etc/kubernetes/*.conf 2>/dev/null
+gpg --batch --yes --symmetric --cipher-algo AES256 \
+    --passphrase-file /root/.backup-passphrase \
+    "$BACKUP_DIR/k8s-config-$TS.tar.gz"
+rm -f "$BACKUP_DIR/k8s-config-$TS.tar.gz"
+
+# 4. 異地複製（3-2-1 原則：3 份、2 種媒體、1 份異地）
+aws s3 cp "$SNAP" "$REMOTE/" --only-show-errors
+aws s3 cp "$BACKUP_DIR/k8s-config-$TS.tar.gz.gpg" "$REMOTE/" --only-show-errors
+
+# 5. 本機保留策略
+find "$BACKUP_DIR" -type f -mtime +$RETENTION_DAYS -delete
+
+echo "etcd backup OK: $SNAP ($(du -h "$SNAP" | cut -f1))"
+SCRIPT
+sudo chmod 700 /usr/local/bin/etcd-backup.sh
+```
+
+#### 排程（systemd timer，比 CronJob 可靠：不依賴叢集本身正常）
+
+```bash
+sudo tee /etc/systemd/system/etcd-backup.service <<'UNIT'
+[Unit]
+Description=etcd snapshot backup
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/etcd-backup.sh
+UNIT
+
+sudo tee /etc/systemd/system/etcd-backup.timer <<'UNIT'
+[Unit]
+Description=Run etcd backup every hour
+[Timer]
+OnCalendar=hourly
+RandomizedDelaySec=5m
+Persistent=true
+[Install]
+WantedBy=timers.target
+UNIT
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now etcd-backup.timer
+sudo systemctl list-timers etcd-backup.timer
+```
+
+| 決策 | 建議 |
+|------|------|
+| 頻率 | 每小時（RPO = 1 小時）；變更頻繁的叢集可 15 分鐘。快照通常 < 100 MB，成本很低 |
+| 在哪台執行 | Stacked HA：任一台 Control Plane 即可（資料一致），建議每台都跑、錯開時間，避免單點 |
+| 保留 | 本機 14 天 + 異地 90 天 + 每月一份長期保存 |
+| 監控 | timer 失敗要告警（`systemctl status etcd-backup.service`、或推送指標到 Pushgateway） |
+| 升級前 | 手動額外做一份，命名標註版本 |
+
+### 3.3 應用資料備份：Velero
+
+Velero 是 Kubernetes 應用層備份的事實標準：備份 **Kubernetes 物件（依 namespace / label 篩選）+ PV 資料**，可還原到同一或不同叢集，也常用於叢集遷移。
+
+#### 安裝（以 MinIO 作為 S3 相容後端為例）
+
+```bash
+# 1. 準備 S3 憑證
+cat > credentials-velero <<'CRED'
+[default]
+aws_access_key_id = minio
+aws_secret_access_key = minio123
+CRED
+
+# 2. 安裝 CLI
+VELERO_VER=v1.15.2   # 請確認與 K8s 版本相容的最新版
+curl -fsSL https://github.com/vmware-tanzu/velero/releases/download/$VELERO_VER/velero-$VELERO_VER-linux-amd64.tar.gz | \
+  sudo tar -xzf - -C /usr/local/bin --strip-components=1 velero-$VELERO_VER-linux-amd64/velero
+
+# 3. 安裝到叢集
+velero install \
+  --provider aws \
+  --plugins velero/velero-plugin-for-aws:v1.11.0 \
+  --bucket velero \
+  --secret-file ./credentials-velero \
+  --use-node-agent \
+  --default-volumes-to-fs-backup \
+  --backup-location-config region=minio,s3ForcePathStyle="true",s3Url=http://minio.minio.svc:9000
+
+kubectl get pods -n velero
+velero backup-location get     # PHASE 應為 Available
+```
+
+| 選項 | 說明 |
+|------|------|
+| `--use-node-agent` + `--default-volumes-to-fs-backup` | 用 Kopia 做**檔案層級**備份，任何 PV 類型都適用（含本指南的 hostPath / local PV），但屬 crash-consistent |
+| `--features=EnableCSI` + VolumeSnapshotClass | 用 **CSI 快照**，速度快、空間效率高，需 CSI driver 支援快照（Longhorn、Ceph、雲端磁碟） |
+
+#### 使用
+
+```bash
+# 手動備份整個 namespace
+velero backup create prod-$(date +%Y%m%d) --include-namespaces production --wait
+velero backup describe prod-20260831 --details
+
+# 排程：每天 02:00，保留 30 天
+velero schedule create prod-daily \
+  --schedule="0 2 * * *" \
+  --include-namespaces production \
+  --ttl 720h
+
+# 排程：每小時備份全叢集物件（不含 PV 資料，秒級完成）
+velero schedule create cluster-objects-hourly \
+  --schedule="@hourly" \
+  --snapshot-volumes=false \
+  --default-volumes-to-fs-backup=false \
+  --ttl 168h
+
+# 還原（誤刪 namespace 的救援）
+velero restore create --from-backup prod-20260831 --wait
+velero restore describe <restore-name>
+
+# 還原到不同 namespace（用於驗證備份或建立測試副本）
+velero restore create --from-backup prod-20260831 \
+  --namespace-mappings production:production-restore-test
+```
+
+#### 應用一致性：pre/post hooks
+
+檔案層級備份對執行中的資料庫是 crash-consistent（相當於斷電後的狀態）。要 application-consistent，需要在備份前凍結或 dump：
+
+```yaml
+# Pod annotation：備份前 flush 並鎖表，備份後解鎖
+metadata:
+  annotations:
+    pre.hook.backup.velero.io/container: mysql
+    pre.hook.backup.velero.io/command: '["/bin/sh","-c","mysql -e \"FLUSH TABLES WITH READ LOCK; SYSTEM sleep 30;\" &"]'
+    pre.hook.backup.velero.io/timeout: 60s
+    post.hook.backup.velero.io/container: mysql
+    post.hook.backup.velero.io/command: '["/bin/sh","-c","mysql -e \"UNLOCK TABLES\""]'
+```
+
+更穩健的做法：資料庫用**自身工具**（`pg_dump`、`mysqldump`、`mongodump`、`etcdctl snapshot`）以 CronJob 定期 dump 到物件儲存，Velero 負責 Kubernetes 物件與非資料庫的 PV。
+
+### 3.4 CSI VolumeSnapshot
+
+支援快照的 CSI driver 可直接以 Kubernetes 原生物件做磁碟快照，不經過 Velero：
+
+```yaml
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshotClass
+metadata:
+  name: longhorn-snap
+driver: driver.longhorn.io
+deletionPolicy: Delete
+---
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshot
+metadata:
+  name: mysql-data-snap-20260831
+  namespace: production
+spec:
+  volumeSnapshotClassName: longhorn-snap
+  source:
+    persistentVolumeClaimName: mysql-data
+---
+# 從快照建立新 PVC（還原或複製）
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mysql-data-restored
+  namespace: production
+spec:
+  storageClassName: longhorn
+  dataSource:
+    name: mysql-data-snap-20260831
+    kind: VolumeSnapshot
+    apiGroup: snapshot.storage.k8s.io
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 20Gi
+```
+
+> 快照通常存在**同一個儲存系統**內，儲存系統整個毀掉時快照也沒了。快照是快速回滾工具，不是異地備份；需搭配 Velero / 儲存系統的異地複製。
+
+### 3.5 GitOps 作為備份的第一道防線
+
+若所有資源定義都在 Git 且由 Argo CD / Flux 同步，則：
+
+- 誤刪 Deployment / ConfigMap → 下一次同步（或手動 sync）自動恢復，**不需要動用備份**。
+- 重建叢集 → 指向同一個 Git repo，數分鐘內所有無狀態服務就位。
+- Git 歷史本身就是變更稽核紀錄。
+
+Git 無法涵蓋的部分才需要 etcd / Velero：Secret（除非用 Sealed Secrets / External Secrets）、PV 資料、由 Controller 動態產生的物件（cert-manager 的憑證、Operator 建立的資源）、以及 `kubectl edit` 手動改過但沒回寫 Git 的東西（這是應該被禁止的）。
+
+### 3.6 備份策略設計
+
+| 項目 | 決策依據 | 範例 |
+|------|---------|------|
+| **RPO**（可遺失多少資料） | 業務對資料遺失的容忍度 | etcd 1 小時；資料庫 15 分鐘（WAL 歸檔）；檔案 24 小時 |
+| **RTO**（多久要恢復） | SLA | 見第四節各情境 |
+| **3-2-1 原則** | 3 份副本、2 種媒體、1 份異地 | 本機磁碟 + 物件儲存 + 異地物件儲存（跨區複製） |
+| **加密** | 備份含 Secret 與私鑰 | 靜態加密（S3 SSE / gpg）+ 傳輸加密；金鑰與備份分開保管 |
+| **不可變性** | 防勒索軟體刪除備份 | S3 Object Lock / 版本控制；備份帳號只有寫入權無刪除權 |
+| **保留** | 合規要求 + 儲存成本 | 每小時保留 2 天、每日 30 天、每週 3 個月、每月 1 年 |
+| **驗證** | 沒還原過的備份不算備份 | 見 3.7 |
+
+### 3.7 備份驗證
+
+| 層級 | 頻率 | 做法 |
+|------|------|------|
+| 檔案完整性 | 每次備份 | `etcdctl snapshot status`；Velero `backup describe` PHASE 為 Completed |
+| 物件層還原 | 每週自動 | Velero 還原到 `*-restore-test` namespace，比對物件數量後刪除 |
+| etcd 還原 | 每月 | 在**測試叢集**（或 Vagrant 環境）用正式備份執行 4.3-A 流程，確認 `kubectl get all -A` 正常 |
+| 完整 DR 演練 | 每季 / 每半年 | 依第四節 runbook 從零重建，量測實際 RTO |
+
+---
+
+## 四、災難復原
+
+### 4.1 災難情境分類
+
+| 等級 | 情境 | 自動恢復？ | 主要手段 | 典型 RTO |
+|------|------|:---------:|---------|---------|
+| L0 | 單一 Pod 崩潰 | ✅ | ReplicaSet 重建 | 秒 |
+| L1 | 單一 Worker 節點故障 | ✅ | 驅逐 + 重排程（2.6 時序） | 5–10 分鐘 |
+| L2 | 單一 Control Plane 故障（HA 叢集） | ✅ | VIP 漂移、Leader Election | 秒 |
+| L2 | 唯一 Control Plane 故障（非 HA） | ❌ | 修復節點或 etcd 還原（4.3-A） | 30 分鐘–數小時 |
+| L3 | etcd 失去 quorum（HA 叢集 2/3 掛） | ❌ | 4.3-B | 30 分鐘–1 小時 |
+| L3 | 憑證過期 | ❌ | 4.3-D | 15–30 分鐘 |
+| L4 | 邏輯錯誤：誤刪 namespace / 錯誤部署 | ❌ | GitOps 同步、Velero 還原（4.3-E） | 5–30 分鐘 |
+| L4 | 資料損毀（資料庫、PV） | ❌ | 應用層備份還原 | 依資料量 |
+| L5 | 叢集完全毀損（儲存全毀、升級失敗無法回復） | ❌ | 全叢集重建（4.3-F） | 1–4 小時 |
+| L6 | 站點級災難（機房失火、區域斷網） | ❌ | 多站點切換（4.3-H） | 15 分鐘–數小時 |
+
+### 4.2 RPO / RTO 與方案對照
+
+```
+             RTO（恢復時間）
+   數小時 ┤  單站 + 每日備份              ← 最低成本
+          │
+   1 小時 ┤  單站 + 每小時 etcd 快照 + Velero
+          │
+   分鐘級 ┤  HA 叢集 + 自動化重建腳本 + GitOps
+          │
+   秒級   ┤  多站 Active-Active + 資料同步複製  ← 最高成本
+          └────┬──────────┬──────────┬──────────┬────
+             秒級       分鐘級      1 小時     24 小時   RPO（資料遺失）
+```
+
+先由業務單位定出各系統的 RPO/RTO（需求分析章節第九節），再反推需要哪一層方案。**不是所有系統都需要秒級**；把 80% 的預算花在 20% 真正關鍵的服務上。
+
+### 4.3 情境演練與 Runbook
+
+以下每個情境都可在本指南的 Vagrant 環境實際演練（`vagrant snapshot save` 可先存檔以便反覆練習）。
+
+#### A. 單一 Control Plane：從 etcd 快照還原
+
+適用：etcd 資料損毀、需要回到某個時間點、誤刪大量資源且無 Velero。
+
+```bash
+# 0. 確認快照可用
+export ETCDCTL_API=3
+sudo etcdctl snapshot status /var/backups/etcd/etcd-20260831-020000.db --write-out=table
+
+# 1. 停止 apiserver 與 etcd（移走 static Pod manifest，kubelet 會自動停掉它們）
+sudo mkdir -p /root/manifests-bak
+sudo mv /etc/kubernetes/manifests/{kube-apiserver,etcd}.yaml /root/manifests-bak/
+sleep 20
+sudo crictl ps | grep -E "etcd|kube-apiserver"   # 應為空
+
+# 2. 保留舊資料目錄（萬一還原失敗可回退）
+sudo mv /var/lib/etcd /var/lib/etcd.broken-$(date +%s)
+
+# 3. 還原到原資料目錄（單節點可直接還原；--name / --initial-* 需與 etcd.yaml 一致）
+sudo etcdctl snapshot restore /var/backups/etcd/etcd-20260831-020000.db \
+  --data-dir=/var/lib/etcd \
+  --name=k8s-master \
+  --initial-cluster=k8s-master=https://192.168.56.10:2380 \
+  --initial-advertise-peer-urls=https://192.168.56.10:2380
+# 註：若 etcd.yaml 的 --name 與 --initial-cluster 值不同，請以 etcd.yaml 為準；
+#     不加這些參數也能還原（會用 default），但 member 名稱會與 manifest 不一致。
+
+# 4. 恢復 static Pod
+sudo mv /root/manifests-bak/*.yaml /etc/kubernetes/manifests/
+sleep 30
+
+# 5. 驗證
+kubectl get nodes
+kubectl get pods -A
+sudo -E etcdctl endpoint status --write-out=table   # 使用 1.3 節的環境變數
+
+# 6. 還原後的清理
+#    - 快照時間點之後建立的 Pod 在 etcd 中不存在，但容器仍在節點上跑 → kubelet 會自動清除
+#    - 快照時間點之後刪除的 Pod 在 etcd 中「復活」→ 會被重新建立
+#    - Worker 節點的 kubelet 可能需要重啟以重新同步：sudo systemctl restart kubelet
+```
+
+> **與 CKA-Q5 的差異：** 考試流程用 `--data-dir=/var/lib/etcd-restore` 並改 manifest 路徑，是為了避免動到原資料。正式環境習慣還原到原路徑並保留舊目錄，避免 manifest 與備份腳本路徑不一致的長期混亂。兩者都正確。
+
+#### B. HA 叢集：etcd 失去 quorum
+
+情境：3 個 Control Plane 中 cp2、cp3 同時損毀（例如兩台在同一台實體機上），只剩 cp1。etcd 沒有 quorum，**叢集唯讀**：既有 Pod 照跑，但無法做任何變更。
+
+```bash
+# ===== 在唯一存活的 cp1 上 =====
+
+# 1. 確認狀態：只有 cp1 healthy，且 etcd 拒絕寫入
+sudo -E etcdctl endpoint health --cluster
+sudo -E etcdctl member list --write-out=table
+
+# 2. 從 cp1 自己的資料做一份快照（比排程備份新）
+sudo -E etcdctl snapshot save /var/backups/etcd/pre-recovery.db
+
+# 3. 停止 cp1 的 apiserver 與 etcd
+sudo mv /etc/kubernetes/manifests/{kube-apiserver,etcd}.yaml /root/
+sleep 20
+
+# 4. 用快照重建為「單成員叢集」（--initial-cluster 只列自己，這會重寫成員資訊，丟棄 cp2/cp3）
+sudo mv /var/lib/etcd /var/lib/etcd.broken-$(date +%s)
+sudo -E etcdctl snapshot restore /var/backups/etcd/pre-recovery.db \
+  --data-dir=/var/lib/etcd \
+  --name=k8s-cp1 \
+  --initial-cluster=k8s-cp1=https://192.168.56.10:2380 \
+  --initial-advertise-peer-urls=https://192.168.56.10:2380 \
+  --initial-cluster-token=etcd-recovered
+
+# 5. 啟動；此時 etcd 是 1 成員叢集，有 quorum，可寫入
+sudo mv /root/{kube-apiserver,etcd}.yaml /etc/kubernetes/manifests/
+sleep 30
+sudo -E etcdctl member list --write-out=table    # 只剩 k8s-cp1
+kubectl get nodes                                 # cp2、cp3 顯示 NotReady
+
+# 6. 清除失效節點的 Node 物件
+kubectl delete node k8s-cp2 k8s-cp3
+
+# ===== 修復或重建 cp2、cp3 =====
+
+# 7. 在 cp2 / cp3 上完全清除舊狀態
+sudo kubeadm reset -f
+sudo rm -rf /etc/kubernetes /var/lib/etcd /etc/cni/net.d
+
+# 8. 在 cp1 產生新的加入憑證與 token
+sudo kubeadm init phase upload-certs --upload-certs        # 取得 certificate-key
+kubeadm token create --print-join-command                  # 取得 join 指令
+
+# 9. cp2 / cp3 以 Control Plane 身分重新加入（kubeadm 會自動 member add 並同步資料）
+sudo kubeadm join 192.168.56.100:6443 --token ... --discovery-token-ca-cert-hash sha256:... \
+  --control-plane --certificate-key ... --apiserver-advertise-address 192.168.56.11
+
+# 10. 驗證回到 3 成員
+sudo -E etcdctl member list --write-out=table
+sudo -E etcdctl endpoint health --cluster
+```
+
+若 **三台全部損毀**但有排程備份：在新機器上依 2.2 步驟建叢集到「步驟 3 init 完成」，然後執行 A 流程用備份覆蓋 cp1 的 etcd，再加入 cp2/cp3。前提是 **PKI 憑證有備份**（否則所有 Worker 都要重新 join）。
+
+#### C. 移除並替換單一故障的 Control Plane（仍有 quorum）
+
+3 台中掛 1 台，叢集正常運作，但需要補回第三台：
+
+```bash
+# 1. 在健康的 cp 上，找出並移除失效的 etcd 成員（否則新節點 join 時 kubeadm 會報 unhealthy member）
+sudo -E etcdctl member list --write-out=table
+sudo -E etcdctl member remove <失效成員的 ID>
+
+# 2. 刪除 Node 物件
+kubectl delete node k8s-cp3
+
+# 3. 新機器（或修復後的 cp3）執行 kubeadm reset，再依 B 的步驟 8–9 重新加入
+```
+
+**別在 etcd 只剩 2 成員時做任何有風險的維護**（升級、重啟）：此時再掛 1 台就失去 quorum。先補回第三台。
+
+#### D. 憑證過期
+
+kubeadm 核發的元件憑證有效期 **1 年**，CA **10 年**。`kubeadm upgrade` 會自動更新憑證，一年內至少升級一次的叢集不會遇到；長期不升級的叢集常在滿一年當天突然「所有 kubectl 指令 x509 錯誤」。
+
+```bash
+# 預防：加入監控，到期前 30 天告警
+sudo kubeadm certs check-expiration
+
+# 更新所有憑證（在每台 Control Plane 執行）
+sudo kubeadm certs renew all
+
+# 憑證更新後必須重啟 static Pod 才會載入新憑證
+sudo mv /etc/kubernetes/manifests/*.yaml /root/manifests-tmp/ && sleep 20 && \
+sudo mv /root/manifests-tmp/*.yaml /etc/kubernetes/manifests/
+
+# 更新 kubectl 使用的 admin.conf
+sudo cp /etc/kubernetes/admin.conf ~/.kube/config
+
+# kubelet 客戶端憑證預設自動輪替（rotateCertificates: true），不需處理；
+# 若 kubelet 憑證已過期且無法自動輪替，該節點需重新 join
+```
+
+**CA 過期**（10 年）：無法用 `certs renew` 處理，需要規劃 CA 輪替（官方文件「Manual Rotation of CA Certificates」），流程涉及所有節點，應在到期前一年開始準備。
+
+#### E. 誤刪 namespace / 錯誤部署
+
+依有無 GitOps 與 Velero 選擇最快路徑：
+
+| 情況 | 恢復方式 | RTO |
+|------|---------|-----|
+| 只刪了無狀態資源，有 GitOps | Argo CD / Flux 手動 sync 或等自動同步 | 1–5 分鐘 |
+| 刪了含 PV 的 namespace，有 Velero | `velero restore create --from-backup <最近備份> --include-namespaces production` | 5–30 分鐘（依資料量） |
+| 刪了含 PV 的 namespace，PV reclaimPolicy 為 `Retain` | PV 變 Released，資料還在：清除 `claimRef` 後重新建立 PVC 綁定（見存儲章節） | 10 分鐘 |
+| 錯誤的 Deployment 版本 | `kubectl rollout undo deploy/<name>`（見 CKAD-Q6） | 1 分鐘 |
+| 錯誤的 ConfigMap 導致全面故障，無 GitOps 無 Velero | etcd 快照還原（A）— **會讓整個叢集回到快照時間點**，影響所有 namespace | 30 分鐘+ |
+
+> etcd 快照還原是「時光機」而非「復原鍵」：所有 namespace 一起回到過去。只在別無選擇時使用；這正是為什麼 Velero 與 GitOps 值得在一開始就部署。
+
+#### F. 全叢集重建
+
+適用：升級失敗且無法回復、儲存全毀、或要遷移到新硬體。
+
+**路徑 1：保留身分（用 PKI 備份 + etcd 快照）**
+
+```
+1. 新 Control Plane 節點完成共同設定
+2. 還原 /etc/kubernetes/pki（從備份 tar 解密）到新節點
+3. kubeadm init --config kubeadm-config.yaml（與原叢集相同參數）
+   → kubeadm 偵測到既有 CA 會沿用，不重新產生
+4. 依 A 流程用 etcd 快照覆蓋
+5. 既有 Worker 因 CA 相同，重啟 kubelet 後自動重新連上（apiserver 位址不變的前提下）
+```
+
+RTO 約 30–60 分鐘；優點是 Worker 不需重新 join、所有 ServiceAccount token 與 Secret 有效。
+
+**路徑 2：全新叢集 + GitOps + Velero**
+
+```
+1. 用 kubeadm-config.yaml 建全新叢集（含新 CA）
+2. 所有 Worker 重新 join
+3. 安裝 CNI、儲存、Velero（指向同一個備份 bucket）
+4. Argo CD / Flux 指向 Git repo → 無狀態服務自動部署
+5. velero restore 還原有狀態服務的 PV 資料
+```
+
+RTO 約 1–4 小時；優點是乾淨、可順便升級版本；缺點是所有憑證與 token 更新，外部整合（CI/CD 的 kubeconfig、OIDC）需重新設定。
+
+**兩條路徑都應寫成腳本並定期在測試環境跑一遍。** 本指南的 `Vagrantfile` + `scripts/` 就是路徑 2 的最小可行版本。
+
+#### G. 大量 Worker 失聯 / 網路分割
+
+情境：交換器故障，一半 Worker 與 Control Plane 斷線。
+
+```
+Control Plane 視角：
+  T+40s   一半節點 NotReady，加 unreachable taint
+  T+340s  開始驅逐這些節點上的 Pod，在剩餘節點重建
+          → 若剩餘節點容量不足（沒有 N+1 餘裕），新 Pod Pending
+
+失聯 Worker 視角：
+  Pod 仍在跑（kubelet 獨立運作），但：
+  - Service 的 Endpoints 已被移除 → 沒有新流量進來
+  - 無法拉新映像、無法回報狀態
+  - 若 Pod 掛掉，kubelet 會依 restartPolicy 在本機重啟
+
+網路恢復後：
+  - 節點回報 Ready，taint 移除
+  - 被驅逐的 Pod 在舊節點上會被 kubelet 清除（因 etcd 中已無此 Pod）
+  - 短時間內同一服務可能有「新舊兩批 Pod」同時服務 → 對有狀態服務是腦裂風險
+```
+
+對策：Control Plane 與 Worker 之間的網路路徑要有冗餘（雙上聯）；有狀態服務用 Lease / 分散式鎖確認唯一性；`topologySpreadConstraints` 跨機櫃分散。
+
+#### H. 站點級災難
+
+```
+1. 確認災難範圍與預估修復時間（決定是否啟動 DR，不要因 5 分鐘網路抖動就切換）
+2. 宣告 DR 啟動，通知相關單位（預先定義決策者與通報鏈）
+3. 確認備援站點資料狀態：最後一次同步時間 = 實際 RPO
+4. 備援站點提升為主：資料庫 promote replica、物件儲存切換
+5. DNS / GSLB 切換流量到備援站點
+6. 驗證核心業務流程
+7. 事後：主站修復後的資料回流（fail-back）計畫 — 通常比切換更複雜
+```
+
+### 4.4 DR 演練計畫
+
+沒有演練過的 DR 計畫在真正災難時幾乎一定會失敗——不是技術不對，是文件過時、密碼找不到、負責人休假。
+
+| 演練 | 頻率 | 方式 | 驗證項目 |
+|------|------|------|---------|
+| etcd 還原 | 每月 | 測試叢集 | 還原後 `kubectl get all -A` 與備份時一致 |
+| Velero 還原 | 每週（自動） | 還原到 `*-restore-test` namespace | 物件數量、Pod 可啟動、資料抽樣比對 |
+| Control Plane 故障 | 每季 | 正式 HA 叢集關掉一台 | VIP 漂移時間、無告警外的異常 |
+| Worker 故障 | 每季 | 正式叢集 drain 或直接關機一台 | Pod 重排程時間、PDB 是否阻擋 |
+| 全叢集重建 | 每半年 | 測試環境從零跑 4.3-F | 實際 RTO、文件缺漏 |
+| 站點切換 | 每年 | 真實或桌面演練（tabletop） | 決策流程、通報鏈、fail-back |
+
+演練後的產出：實測 RTO/RPO、發現的問題清單、runbook 更新。
+
+**Runbook 範本（每個情境一份）：**
+
+```markdown
+# Runbook：<情境名稱，如「etcd 失去 quorum」>
+
+- 最後更新 / 最後演練日期：
+- 負責人（主 / 副）：
+- 觸發條件（什麼徵兆代表是這個情境）：
+- 影響範圍（哪些服務、使用者會受影響）：
+- 預估 RTO / RPO：
+
+## 前置檢查
+- [ ] 確認徵兆符合（列出要看的指標 / 指令）
+- [ ] 確認備份存在且可讀（指令）
+- [ ] 通知（誰、怎麼通知）
+
+## 步驟
+1. （指令 + 預期輸出）
+2. ...
+
+## 驗證
+- [ ] （指令 + 預期輸出）
+
+## 回退
+（步驟失敗時如何回到執行前狀態）
+
+## 事後
+- [ ] 事故報告
+- [ ] 更新此 runbook
+```
+
+### 4.5 DR 檢核表
+
+- [ ] 每個關鍵系統有書面 RPO / RTO，且經業務單位確認
+- [ ] etcd 每小時快照，異地存放，已驗證可還原
+- [ ] PKI 與加密設定已備份且加密存放，金鑰保管人明確
+- [ ] 所有資源定義在 Git；`kubectl edit` 直接修改正式環境已被禁止或會被 GitOps 覆蓋
+- [ ] Velero 排程運作中，`backup-location` 為 Available，最近一次還原測試通過
+- [ ] 資料庫有應用層備份（dump / WAL 歸檔），非僅磁碟快照
+- [ ] 憑證到期監控已設定（`kubeadm certs check-expiration` 或 Prometheus `certmanager_*` / 自訂 exporter）
+- [ ] 4.3 每個情境都有 runbook，且一年內演練過
+- [ ] 備份儲存有不可變保護（Object Lock），備份帳號無刪除權限
+- [ ] DR 決策者與通報鏈已定義，聯絡方式不依賴叢集本身（別把 on-call 名單只放在叢集裡的 wiki）
+- [ ] 重建叢集所需的一切（kubeadm-config.yaml、映像、Helm values、密碼保險箱）都可在**叢集完全消失**的情況下取得
+
+---
+
+## 五、設計決策建議
+
+前面各節列出了選項與取捨；本節直接給出**「沒有特殊理由就這樣選」的預設建議**。依叢集規模分三個等級，每個決策附上理由，以及什麼情況下該改變主意。
+
+### 5.1 決策矩陣（依規模）
+
+| 決策項目 | 學習 / 開發<br>（1 CP + 1–3 Worker） | 小型正式<br>（3 CP + 3–20 Worker） | 大型正式<br>（3–5 CP + 20–500 Worker） |
+|---------|:--:|:--:|:--:|
+| **Control Plane 拓撲** | 單一 | 3 台 Stacked etcd | 3 台 Stacked（節點 < 200）或 3 CP + 3 External etcd |
+| **`--control-plane-endpoint`** | 建議仍設 DNS 名稱 | **必須**：VIP 或 DNS | **必須**：LB DNS 名稱 |
+| **VIP / LB** | 無 | kube-vip（ARP） | 雲端 LB；地端 kube-vip BGP 或 HAProxy + keepalived |
+| **etcd 磁碟** | 共用 | 獨立 SSD | 獨立 NVMe；考慮 Events 分流 |
+| **Pod CIDR** | 10.244.0.0/16 | /16（≤ 256 節點） | /14 或更大；`node-cidr-mask-size` 依 maxPods 調整 |
+| **Service CIDR** | 10.96.0.0/12 | 預設 | 預設（已有 100 萬個 IP） |
+| **CNI** | Flannel | Calico | Cilium（新建）/ Calico（團隊已熟悉） |
+| **封裝模式** | VXLAN | 同 L2 用 host-gw / BGP，否則 VXLAN | 原生路由（BGP）或 Cilium eBPF |
+| **kube-proxy 模式** | iptables | iptables；Service > 1,000 改 IPVS | IPVS；或 Cilium 取代 kube-proxy |
+| **DNS** | CoreDNS 預設 | CoreDNS 反親和 + NodeLocal DNSCache | 同左 + `cluster-proportional-autoscaler` |
+| **對外入口** | NodePort | MetalLB L2 + nginx Ingress（≥ 2 副本） | MetalLB BGP / 雲端 LB + Ingress 專用節點；新專案評估 Gateway API |
+| **儲存** | hostPath / local-path | Longhorn（無外部儲存）或 NFS（有 NAS） | Rook-Ceph、企業 CSI、或雲端 CSI；多個 StorageClass 分級 |
+| **資源保留** | 不設 | kubeReserved + systemReserved + evictionHard | 同左 + `cpuManagerPolicy: static`（延遲敏感節點） |
+| **稽核日誌** | 關 | **開**（Metadata 等級 + Secret 排除 RequestResponse） | 開 + 送到 SIEM |
+| **Secret 靜態加密** | 關 | **開**（aescbc / secretbox） | 開，KMS provider（雲端 KMS / Vault） |
+| **身分驗證** | admin.conf | OIDC（Keycloak / Azure AD） | OIDC + 群組對應 RBAC |
+| **Pod Security** | 無 | 全部 namespace `baseline`，敏感者 `restricted` | 同左 + OPA Gatekeeper / Kyverno 策略 |
+| **監控** | metrics-server | kube-prometheus-stack | 同左 + Thanos / Mimir 長期儲存、多叢集匯總 |
+| **日誌** | `kubectl logs` | Loki + Promtail | Loki / Elasticsearch 叢集、保留策略 |
+| **etcd 備份** | 手動練習 | 每小時 systemd timer + 異地 | 同左 + 每台 CP 錯開執行 |
+| **應用備份** | 無 | Velero（檔案層級）+ DB 原生 dump | Velero + CSI 快照 + DB 原生 + 異地複製 |
+| **GitOps** | 可選 | Argo CD 或 Flux | 必須；多叢集用 ApplicationSet |
+| **版本策略** | 最新 | 最新減一；每 6 個月升級 | 同左；先在 staging 叢集演練 |
+| **DR 目標** | 無 | RPO 1h / RTO 1h（etcd 快照 + 重建腳本） | RPO 分鐘級 / RTO 分鐘級（多站點 Active-Passive 以上） |
+
+### 5.2 關鍵決策的理由與取捨
+
+以下是最常被問「為什麼」的十二個決策。
+
+**1. 即使只有一台 Control Plane，也要設 `--control-plane-endpoint`**
+- 選它：成本為零（一筆 DNS 記錄指向唯一那台），日後升級 HA 只需改 DNS。
+- 不設的代價：憑證 SAN、所有節點的 kubeconfig 都綁死單一 IP；升級 HA 要重簽憑證並逐台修改。
+- 何時例外：純拋棄式的實驗環境（如本指南 Vagrant）。
+
+**2. Control Plane 選 3 台，不是 2 台也不是 5 台**
+- 3 台：容忍 1 台故障，是 HA 的最低配置。
+- 2 台：容錯能力與 1 台相同（quorum = 2，掛 1 台就失去 quorum），純粹多一個故障點。
+- 5 台：容忍 2 台故障，但每次寫入要 3 台確認，延遲上升；只有節點數 > 500 或跨可用區部署才值得。
+
+**3. Stacked etcd 優先於 External etcd**
+- 選它：機器數減半、kubeadm 原生支援、憑證管理簡單。
+- 何時改：Control Plane 節點 CPU / 磁碟 I/O 明顯被 etcd 拖累（`etcd_disk_wal_fsync` p99 因 apiserver 負載升高而惡化）、或安全政策要求 etcd 網路隔離。
+
+**4. 地端 VIP 選 kube-vip，不選 HAProxy + keepalived**
+- 選它：以 static Pod 形式跑在 Control Plane 上，無額外機器、無額外套件、設定只有一個 manifest；同時可提供 Service LoadBalancer。
+- 不選的理由：HAProxy + keepalived 更成熟、可觀測性更好、可做更精細的健康檢查。
+- 何時改：團隊已有 HAProxy 維運經驗；或需要對 apiserver 做 L7 級別的流量控制。
+
+**5. CNI：Flannel（學習）→ Calico（一般正式）→ Cilium（新建大型）**
+- Flannel：最簡單，但不支援 NetworkPolicy，正式環境幾乎必然會需要。
+- Calico：NetworkPolicy + BGP 原生路由 + 成熟穩定，是「不會出錯」的正式環境選擇。
+- Cilium：eBPF 帶來的效能、可觀測性（Hubble）、取代 kube-proxy 都是實質優勢，但學習曲線陡、核心版本要求高、除錯需要 eBPF 知識。
+- 何時改：叢集規模 > 100 節點或需要 L7 policy → 值得投資 Cilium；團隊小、求穩 → Calico。
+
+**6. kube-proxy 保持 iptables，直到 Service 超過 1,000 個**
+- 選它：預設、最多人用、問題最容易搜到答案。
+- 何時改：`kubectl get svc -A | wc -l` > 1,000，或觀察到 Endpoint 變更後生效延遲 > 數秒 → 切 IPVS。新建大型叢集用 Cilium 則直接取代 kube-proxy。
+
+**7. 記憶體 request = limit；CPU 只設 request、limit 不設或設寬**
+- 記憶體不可壓縮，超賣的後果是 OOM 殺錯 Pod；request = limit 讓行為可預測。
+- CPU 可壓縮，CFS throttling 對延遲的傷害通常大於節點超載；不設 limit 讓閒置 CPU 被充分利用。
+- 何時改：多租戶環境需要硬性隔離、或某個 Pod 曾經跑滿 CPU 影響鄰居 → 對該 Pod 設 limit = request × 2–4。
+
+**8. 資料庫用 RWO 磁碟 + 資料庫自身複製，不依賴儲存層 HA**
+- 儲存層複製（Longhorn / Ceph）保護的是磁碟壞掉；資料庫複製（PostgreSQL streaming、MySQL Group Replication）保護的是資料庫程序掛掉並提供讀寫分離。兩者互補，但若只能選一個，選資料庫層的。
+- 用 Operator（CloudNativePG、Percona、Strimzi）處理 failover，不要自己寫。
+- 避免 RWX：NFS 的鎖與效能問題會在最忙的時候出現；需要共享檔案時優先考慮物件儲存（S3 API）。
+
+**9. 備份三層缺一不可：etcd 快照 + Velero + GitOps**
+- etcd 快照：唯一能救回「叢集本身」（含 ServiceAccount token、Lease、動態產生的資源）的方法。
+- Velero：唯一能做「只還原某個 namespace」的方法。
+- GitOps：唯一能在「叢集完全消失」時快速重建的方法，且是變更稽核紀錄。
+- 只做其中一層的常見後果：只有 etcd → 誤刪一個 namespace 要整個叢集時光倒流；只有 Velero → 叢集憑證壞了無法救；只有 GitOps → Secret 與 PV 資料沒了。
+
+**10. 實施順序：GitOps → 監控 → etcd 備份 → Velero → 調優**
+- GitOps 先做：越晚做，累積的「手動改過但沒進 Git」的漂移越多，遷移成本越高。
+- 監控在調優之前：沒有指標的調優是猜測。
+- Velero 在 etcd 備份之後：etcd 備份 10 分鐘可完成，先確保最基本的保護。
+- 效能調優最後：多數叢集在合理的資源保留與 request/limit 設定下不需要進一步調優；等指標顯示瓶頸再動手。
+
+**11. 稽核日誌與 Secret 加密從第一天開啟**
+- 事後開啟稽核只需改 apiserver manifest，但事後開啟加密需要 `kubectl get secrets -A -o json | kubectl replace -f -` 重寫所有 Secret，且加密金鑰的備份流程要從此納入 DR。
+- 合規稽核幾乎一定會問「從什麼時候開始有紀錄」。
+- 何時例外：純學習環境。
+
+**12. 版本選最新減一，每 6 個月升級一次**
+- 最新版的 bug 由別人先踩；減一版仍有 ~10 個月支援期。
+- 每年 3 個 minor 版本，每次只能升一個 minor；6 個月升一次剛好不會落後到超出支援視窗（3 個版本 ≈ 12 個月）。
+- 升級也順便更新憑證，避開一年到期的地雷。
+- 何時改：託管服務（EKS / GKE / AKS）有自己的版本節奏，跟隨即可。
+
+### 5.3 反模式：常見的錯誤決策
+
+| 反模式 | 後果 | 正確做法 |
+|-------|------|---------|
+| 2 台 Control Plane | 與 1 台容錯相同，多一個故障點 | 1 台或 3 台 |
+| Pod / Service CIDR 與內網或 VPN 重疊 | 特定使用者連不到內部服務，極難排查 | 需求分析 5.1：三網段與所有既有網段確認不重疊 |
+| etcd 與容器映像共用磁碟 | 映像拉取時 etcd fsync 延遲飆高，leader 反覆切換 | etcd 獨立 SSD |
+| 只有 HA 沒有備份 | `kubectl delete ns` 被忠實複製到三個成員 | 3.1 三層備份 |
+| 備份從未還原測試 | 需要時才發現快照損壞、密碼遺失、流程過時 | 3.7 定期驗證 |
+| 所有 Pod 都設 CPU limit = request（追求 Guaranteed） | 大量 CFS throttling，延遲比不設 limit 更差 | 5.2 第 7 點 |
+| liveness probe 檢查資料庫連線 | 資料庫慢 → 所有 Pod 被重啟 → 雪崩 | liveness 只檢查程序本身 |
+| 用 `kubectl edit` 改正式環境 | Git 與實際狀態漂移；重建時遺失變更 | GitOps + RBAC 限制直接寫入 |
+| Ingress Controller 單副本；CoreDNS 兩副本在同一節點 | 該節點掛掉 = 全站 502 / DNS 失效 | 2.7 反親和 + PDB |
+| 忽略憑證到期 | 滿一年當天所有 kubectl 指令 x509 錯誤 | 4.3-D 監控 + 每年升級 |
+| 正式資料放 `hostPath` | Pod 換節點資料就不見；節點磁碟壞了資料全丟 | 6.2 選擇有副本的儲存 |
+| 不設 kubeReserved / systemReserved | Pod 吃光節點資源，kubelet 失聯，整個節點 NotReady | 1.6 資源保留 |
+| 監控腳本每 10 秒 `kubectl get pods -A` | apiserver 與 etcd 被 list 請求壓垮 | 用 watch / informer；或用 metrics 而非 list |
+| Flannel 用在需要 NetworkPolicy 的正式環境 | NetworkPolicy 建立成功但完全不生效，產生安全假象 | Calico / Cilium |
+| 單一 StorageClass 給所有工作負載 | 日誌與資料庫搶同一組磁碟 IOPS | 依效能等級分 StorageClass |
+| 沒有 PDB 就執行節點升級 | drain 一次驅逐所有副本，服務中斷 | 每個正式服務都有 PDB |
+
+### 5.4 建議的實施路線圖
+
+```
+Phase 0 ── 安裝前（1–2 週）
+  ├─ 需求收集與分析（需求分析章節）
+  ├─ 確定不可逆決策：CIDR ×2、control-plane-endpoint、CNI、版本、叢集 DNS 網域
+  ├─ 產出 kubeadm-config.yaml 並進 Git
+  └─ 磁碟 fio 測試、網路 MTU 確認、防火牆申請
+
+Phase 1 ── 叢集上線（第 1 週）
+  ├─ 安裝 3 CP HA（2.2）+ Worker
+  ├─ 資源保留 + evictionHard（1.6）
+  ├─ metrics-server + kube-prometheus-stack（1.9）
+  ├─ etcd 備份 timer + 異地（3.2）
+  └─ GitOps（Argo CD / Flux）接管所有部署（3.5）
+
+Phase 2 ── 強化（第 1 個月）
+  ├─ 稽核日誌 + Secret 加密 + Pod Security（需求分析第七節）
+  ├─ OIDC + RBAC 分權
+  ├─ CoreDNS / Ingress 反親和 + PDB（2.7）
+  ├─ Velero + DB 原生備份（3.3）
+  ├─ 所有正式服務補齊 replicas / spread / PDB / probe（2.5）
+  └─ 第一次 etcd 還原演練（測試叢集）
+
+Phase 3 ── 持續營運（每季）
+  ├─ 依指標調優（1.3–1.8），不預先猜測
+  ├─ DR 演練：Control Plane 故障、Worker 故障、Velero 還原（4.4）
+  ├─ 每 6 個月升級一個 minor 版本
+  ├─ 檢視容量：節點 request 佔比、Pod CIDR 用量、etcd DB 大小
+  └─ 更新 runbook 與需求文件的決策紀錄
+```
+
+每個 Phase 的完成標準對應本章的檢核表：Phase 1 → 2.10 HA 檢核表前半；Phase 2 → 4.5 DR 檢核表；Phase 3 → 兩張檢核表全部打勾且演練紀錄在一年內。
 
 ---
 
