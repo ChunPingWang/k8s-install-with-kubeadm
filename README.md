@@ -6,6 +6,8 @@
 - **方法一：Vagrant 自動化安裝**（推薦，適合本地開發測試）
 - **方法二：手動逐步安裝**（適合正式環境或學習每個步驟）
 
+若目標是正式環境，請先閱讀「[安裝前需求收集與分析](#安裝前需求收集與分析)」章節，確定 Pod/Service CIDR、Control Plane Endpoint、CNI 等**事後無法變更**的決策後再開始安裝。
+
 ---
 
 ## 方法一：Vagrant + VirtualBox 自動化安裝
@@ -563,9 +565,610 @@ Node 1 (192.168.56.11)          Node 2 (192.168.56.12)
 
 ---
 
+## 安裝前需求收集與分析
+
+kubeadm 的許多參數（Pod CIDR、Service CIDR、Control Plane Endpoint、CRI、cgroup driver 等）在 `kubeadm init` 之後**極難或無法變更**，改錯了幾乎等同重建叢集。因此在動手之前，應先系統性地收集需求、做出決策，再把決策轉成安裝參數。
+
+```
+┌──────────────┐    ┌──────────────┐    ┌──────────────┐    ┌──────────────┐
+│  1. 需求收集  │ ─► │  2. 需求分析  │ ─► │  3. 安裝決策表 │ ─► │  4. 執行安裝  │
+│  訪談 / 問卷  │    │  容量、HA、   │    │  kubeadm-     │    │  方法一 / 二  │
+│              │    │  網路、安全   │    │  config.yaml  │    │              │
+└──────────────┘    └──────────────┘    └──────────────┘    └──────────────┘
+```
+
+本章先列出**該問哪些問題**，再逐項說明**如何分析**與**對應的安裝決策**，最後提供本指南範例環境的完整決策表與可複製的需求收集範本。
+
+---
+
+### 一、需求收集清單
+
+在與使用單位（開發團隊、營運團隊、資安團隊）訪談時，至少要釐清以下面向。右欄標示每個問題會影響哪個安裝決策，方便回頭對照。
+
+| 面向 | 要釐清的問題 | 影響的安裝決策 |
+|------|-------------|---------------|
+| **用途** | 學習測試？開發環境？正式營運？邊緣節點？ | HA 架構、CNI、儲存、安全強度 |
+| **工作負載** | 跑什麼應用？無狀態 Web？資料庫？批次運算？AI/GPU？ | 節點規格、儲存類型、Device Plugin |
+| **規模** | 預估 Pod 數量、節點數量、未來 1–2 年成長幅度？ | Pod/Service CIDR 大小、節點 sizing |
+| **可用性** | 可接受的停機時間（SLA）？Control Plane 掛掉能否接受？ | 單一 vs 多 Control Plane、etcd 拓撲 |
+| **網路** | 既有內網網段？VPN 網段？是否有多個叢集需互通？需要 NetworkPolicy 嗎？ | Pod/Service CIDR、CNI 選型 |
+| **對外服務** | 如何讓外部流量進入？有硬體 LB 或雲端 LB 嗎？ | NodePort / MetalLB / Ingress / Gateway |
+| **儲存** | 需要持久化資料嗎？多 Pod 共享讀寫（RWX）？快照/備份？ | StorageClass、CSI driver |
+| **安全合規** | 需符合哪些規範（CIS、ISO 27001、個資法）？稽核日誌保存多久？ | 稽核政策、加密、PodSecurity、RBAC |
+| **身分驗證** | 使用者如何登入？有 AD / LDAP / OIDC 嗎？ | apiserver OIDC 參數、RBAC 設計 |
+| **基礎環境** | 實體機、VM、還是雲端？OS 版本？是否可連外網？有 Proxy 嗎？ | 版本選型、映像檔來源、air-gap 準備 |
+| **營運** | 誰負責維運？有既有監控/日誌系統嗎？升級與備份頻率？ | 監控堆疊、etcd 備份、升級策略 |
+
+> **實務建議：** 把這張表印出來或做成共用文件，逐項填寫並記錄「決策者」與「決策日期」。日後爭議（例如「為什麼當初選 Flannel？」）時可以回溯。
+
+---
+
+### 二、用途與情境分析
+
+不同用途對應完全不同的架構取捨。先確定叢集定位，後續的所有決策才有依據。
+
+| 情境 | 特徵 | 建議架構 | 本指南對應 |
+|------|------|---------|-----------|
+| **學習 / 個人實驗** | 單人使用、可隨時重建、資源有限 | 1 master + 1–2 worker，Flannel，無持久儲存 | 方法一（Vagrant） |
+| **團隊開發 / 測試** | 多人共用、需模擬正式環境行為、允許短暫停機 | 1 master + N worker，Calico（可測 NetworkPolicy），NFS 或 local PV | 方法二 + 調整 CNI |
+| **正式營運（小型）** | 需 SLA、資料不可遺失 | 3 control plane（stacked etcd）+ N worker，Calico/Cilium，CSI 儲存，稽核與備份 | 方法二 + HA 章節參數 |
+| **正式營運（大型）** | 數百節點以上、多租戶、多團隊 | 3–5 control plane + 外部 etcd，Cilium，多 StorageClass，OIDC，多叢集管理 | 超出本指南範圍 |
+| **邊緣 / IoT** | 資源受限、網路不穩 | 考慮 k3s / k0s 而非 kubeadm | 超出本指南範圍 |
+
+**判斷準則：**
+- 若答案是「掛掉會有人打電話罵」→ 至少 3 個 Control Plane。
+- 若答案是「資料掉了會出事」→ 必須規劃 etcd 備份與持久儲存，不能只用 `emptyDir`/`hostPath`。
+- 若答案是「多個團隊共用」→ 需要 NetworkPolicy（排除 Flannel）、RBAC 分權、ResourceQuota。
+
+---
+
+### 三、規模與容量規劃
+
+#### 3.1 kubeadm 官方最低需求
+
+| 角色 | CPU | 記憶體 | 磁碟 | 說明 |
+|------|-----|-------|------|------|
+| Control Plane | 2 vCPU | 2 GB | 20 GB | 低於此值 `kubeadm init` 的 preflight check 會失敗（可用 `--ignore-preflight-errors` 略過，但不建議） |
+| Worker | 1 vCPU | 1 GB | 20 GB | 實際需求取決於工作負載 |
+
+這是「能跑起來」的下限，不是「能用」的建議值。
+
+#### 3.2 Worker 節點 Sizing 公式
+
+```
+單一節點可用資源 = 節點總資源 − kube-reserved − system-reserved − eviction-threshold
+
+所需 Worker 節點數 = ceil( Σ(所有 Pod requests) × 冗餘係數 / 單一節點可用資源 )
+```
+
+- **kube-reserved**：留給 kubelet、containerd、kube-proxy 等元件（建議 CPU 0.5–1 核、記憶體 1–2 GB）。
+- **system-reserved**：留給 OS（sshd、journald 等，建議記憶體 0.5–1 GB）。
+- **eviction-threshold**：kubelet 預設在可用記憶體 < 100Mi 時開始驅逐 Pod。
+- **冗餘係數**：建議 1.3–1.5，確保任一節點故障時，其他節點仍能承接其 Pod（N+1）。
+
+**範例計算：**
+
+```
+需求：20 個微服務，每個 3 副本，平均 request = 0.25 CPU / 512Mi
+      → Σ requests = 60 Pod × 0.25 CPU = 15 CPU；60 × 512Mi = 30 GB
+
+節點規格：4 vCPU / 16 GB
+可用資源：CPU 4 − 1（reserved）= 3；記憶體 16 − 2（reserved）− 0.5（eviction）≈ 13.5 GB
+
+所需節點：CPU：ceil(15 × 1.4 / 3) = 7；記憶體：ceil(30 × 1.4 / 13.5) = 4
+→ 取較大者：7 台 Worker（CPU 是瓶頸，可考慮改用 8 vCPU 規格降至 4 台）
+```
+
+#### 3.3 Kubernetes 內建上限
+
+規劃時不可超過以下數值（v1.32）：
+
+| 項目 | 上限 | 備註 |
+|------|------|------|
+| 每節點 Pod 數 | 110（預設） | 可透過 kubelet `maxPods` 調整，但受 Pod CIDR 每節點子網大小限制 |
+| 節點總數 | 5,000 | |
+| Pod 總數 | 150,000 | |
+| 容器總數 | 300,000 | |
+
+#### 3.4 磁碟規劃
+
+| 用途 | 建議 | 原因 |
+|------|------|------|
+| **etcd 資料目錄**（`/var/lib/etcd`） | SSD / NVMe，獨立磁碟 | etcd 對 fsync 延遲極敏感（p99 需 < 10ms），與容器映像共用磁碟會導致 leader 切換、apiserver 逾時 |
+| **容器映像與 Layer**（`/var/lib/containerd`） | 依映像數量估算，至少 50 GB | 映像累積速度常超乎預期，建議設定 kubelet imageGC 門檻 |
+| **日誌**（`/var/log/pods`） | 設定 `containerLogMaxSize` / `containerLogMaxFiles` | 預設 10Mi × 5 個檔案，高流量應用需調大或接外部日誌系統 |
+| **臨時儲存**（`emptyDir`） | 依應用需求 | 計入節點 ephemeral-storage 配額 |
+
+---
+
+### 四、高可用性需求
+
+#### 4.1 三種 Control Plane 拓撲
+
+```
+單一 Control Plane                Stacked etcd HA                  External etcd HA
+（本指南範例）                     （小型正式環境）                   （大型正式環境）
+
+┌────────────┐                  ┌──── LB / VIP ────┐              ┌──── LB / VIP ────┐
+│ apiserver  │                  │                   │              │                   │
+│ etcd       │              ┌───┴───┐ ┌───┴───┐ ┌───┴───┐      ┌───┴───┐ ┌───┴───┐ ┌───┴───┐
+│ scheduler  │              │ api   │ │ api   │ │ api   │      │ api   │ │ api   │ │ api   │
+│ ctrl-mgr   │              │ etcd  │ │ etcd  │ │ etcd  │      │ sched │ │ sched │ │ sched │
+└────────────┘              └───────┘ └───────┘ └───────┘      └───┬───┘ └───┬───┘ └───┬───┘
+                                                                   │         │         │
+掛掉 = 叢集無法管理           掛掉 1 台仍可運作                  ┌───┴───┐ ┌───┴───┐ ┌───┴───┐
+（既有 Pod 仍會跑）           最少 3 台（etcd quorum）            │ etcd  │ │ etcd  │ │ etcd  │
+                                                               └───────┘ └───────┘ └───────┘
+                                                               etcd 與 apiserver 故障域分離
+                                                               最少 3 + 3 = 6 台
+```
+
+#### 4.2 etcd Quorum 與節點數
+
+etcd 採用 Raft 共識，需要**過半數**節點存活才能寫入。節點數必須是**奇數**。
+
+| etcd 節點數 | Quorum | 可容忍故障數 | 說明 |
+|------------|--------|-------------|------|
+| 1 | 1 | 0 | 學習/測試 |
+| 3 | 2 | 1 | 正式環境最低建議 |
+| 5 | 3 | 2 | 大型叢集；再多會增加寫入延遲 |
+| 2 / 4 | 2 / 3 | 1 / 1 | **沒有意義**：容錯數與 1 / 3 台相同，反而多一個故障點 |
+
+#### 4.3 必須在 `kubeadm init` 時決定的 HA 參數
+
+> **關鍵：`--control-plane-endpoint`**
+>
+> 這個參數指定 apiserver 的「穩定位址」（DNS 名稱或 VIP），會被寫入 apiserver 憑證的 SAN、`admin.conf`、以及所有 Worker 的 `kubelet.conf`。
+>
+> - **未設定**（本指南範例）：Worker 直接連 `192.168.56.10:6443`，日後要加第二台 Control Plane 時，必須重簽憑證並逐一修改所有節點的 kubeconfig，非常麻煩。
+> - **有設定**：即使目前只有一台 Control Plane，也可以先設定 `--control-plane-endpoint=k8s-api.example.com:6443`，DNS 先指向唯一那台；日後加 LB 只需改 DNS。
+>
+> **建議：只要有一絲可能未來要升級成 HA，就在 init 時設定 `--control-plane-endpoint`。** 成本幾乎為零。
+
+HA 前端負載平衡器的選項：
+
+| 方案 | 適用環境 | 說明 |
+|------|---------|------|
+| 雲端 LB（AWS NLB、GCP TCP LB） | 公有雲 | 最簡單，健康檢查打 `/healthz` |
+| HAProxy + keepalived | 地端 / VM | keepalived 提供 VIP，HAProxy 做 TCP 6443 轉發 |
+| kube-vip | 地端，不想額外裝機器 | 以 static Pod 形式跑在 Control Plane 上，同時提供 VIP 與 LB |
+
+---
+
+### 五、網路規劃
+
+網路是**最不可逆**的決策，也是跨團隊衝突最多的地方（IP 網段通常由網路團隊管理）。
+
+#### 5.1 三個互不重疊的網段
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Node Network（實體/VM 網段）      例：192.168.56.0/24              │
+│    └── 節點 IP、apiserver 位址、NodePort 對外位址                  │
+│                                                                   │
+│  Pod CIDR（--pod-network-cidr）    例：10.244.0.0/16               │
+│    └── 每個 Pod 一個 IP；每節點切一個 /24 子網（預設）              │
+│                                                                   │
+│  Service CIDR（--service-cidr）    例：10.96.0.0/12（預設）         │
+│    └── ClusterIP 虛擬 IP，只存在於 iptables/IPVS 規則中             │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**三者必須互不重疊，且不可與以下網段重疊：**
+- 企業內網（辦公室、資料中心）既有網段
+- VPN 用戶端網段
+- 其他 Kubernetes 叢集的 Pod/Service CIDR（若日後需跨叢集互通）
+- 雲端 VPC 的 CIDR
+- Docker 預設的 `172.17.0.0/16`（若節點上同時跑 Docker）
+
+> **常見災難：** Pod CIDR 用了 `10.0.0.0/16`，結果公司 VPN 也是 `10.0.x.x`——Pod 永遠連不到內部資料庫，而且問題只在 VPN 使用者身上出現，極難排查。
+
+#### 5.2 Pod CIDR 大小計算
+
+kube-controller-manager 會從 Pod CIDR 為每個節點切出一個子網（`--node-cidr-mask-size`，IPv4 預設 `/24`）。
+
+```
+Pod CIDR /16  ÷  每節點 /24  =  2^(24−16) = 256 個節點
+每節點 /24    =  254 個可用 IP（> 預設 maxPods 110，足夠）
+
+若需 1,000 個節點：Pod CIDR 至少 /14（2^10 = 1,024 個 /24）
+若每節點只需 50 Pod：可將 node-cidr-mask-size 設為 /26（62 IP），同樣的 /16 可支援 1,024 節點
+```
+
+決策時考慮**未來 2 年的最大節點數**，並留 2 倍餘裕。
+
+#### 5.3 CNI 選型決策
+
+| 需求 | Flannel | Calico | Cilium |
+|------|:-------:|:------:|:------:|
+| 安裝簡單、學習用 | ✅ | ✅ | ⚠️ 較複雜 |
+| NetworkPolicy 強制執行 | ❌ 不支援 | ✅ | ✅ |
+| L7 Policy（HTTP path / method） | ❌ | ❌ | ✅ |
+| 不封裝（BGP / 原生路由，效能較好） | ❌ | ✅ | ✅ |
+| 取代 kube-proxy（eBPF） | ❌ | ⚠️ 部分 | ✅ |
+| 可觀測性（流量圖、Hubble） | ❌ | ⚠️ 需 Enterprise | ✅ |
+| 傳輸加密（WireGuard / IPsec） | ❌ | ✅ | ✅ |
+| 多租戶正式環境 | ❌ | ✅ | ✅ |
+| 核心版本需求 | 低 | 低 | ≥ 5.10 建議 |
+
+**決策準則：**
+- 只是學習或 CKA 練習 → **Flannel**（本指南）。
+- 需要 NetworkPolicy 但團隊對 eBPF 不熟 → **Calico**。
+- 正式環境、重視效能與可觀測性、核心夠新 → **Cilium**。
+
+#### 5.4 封裝模式與 MTU
+
+VXLAN 封裝會在每個封包加上 50 bytes 標頭。實體 MTU 1500 時，Pod 介面 MTU 需降為 **1450**（Flannel 自動處理）。若底層網路已是 VXLAN（例如 OpenStack、某些雲端 VPC），會造成**雙重封裝**，MTU 需再減 50，否則出現「小封包正常、大檔案傳輸卡住」的詭異問題。
+
+規劃時確認：
+- 實體網路 MTU（是否支援 Jumbo Frame 9000？可大幅降低封裝損耗）
+- 底層是否已有 overlay
+- 若節點都在同一 L2 網段，可考慮 Calico/Cilium 的原生路由模式，完全避免封裝
+
+#### 5.5 多網卡與介面選擇
+
+VM 環境（Vagrant、VMware、OpenStack）常有多張網卡。本指南的 Vagrant 節點就有兩張：
+
+| 介面 | 位址 | 用途 | 問題 |
+|------|------|------|------|
+| `eth0` | 10.0.2.15（NAT） | 連外網 | **所有 VM 都是同一個 IP**，若 kubelet 或 Flannel 誤選此介面，節點間完全無法通訊 |
+| `eth1` | 192.168.56.x（Host-only） | 節點互通 | 正確的叢集介面 |
+
+需事先決定並在安裝時明確指定：
+- `kubeadm init --apiserver-advertise-address=<eth1 IP>`
+- kubelet `--node-ip=<eth1 IP>`（見「五、修正節點 Internal IP」）
+- Flannel `--iface=eth1`（見「三、部署 Pod 網路」）
+
+#### 5.6 對外流量入口
+
+| 方案 | 適用 | 限制 |
+|------|------|------|
+| NodePort | 測試 | 埠號 30000–32767，需自行在前面放 LB |
+| 雲端 LoadBalancer | 公有雲 | 每個 Service 一個 LB，費用高 |
+| MetalLB | 地端 | 需保留一段 Node Network 內的 IP 池給它（例：192.168.56.200–250） |
+| Ingress Controller（nginx / traefik） | HTTP/HTTPS | 需搭配上述之一提供入口 IP |
+| Gateway API | 新專案 | Ingress 的後繼者，需 CNI 或 Controller 支援 |
+
+**需向網路團隊申請：** MetalLB 的 IP 池、Ingress 的 DNS 名稱與 TLS 憑證來源。
+
+#### 5.7 節點間必須開放的連接埠
+
+安裝前提交給防火牆 / 雲端 Security Group 管理者：
+
+| 方向 | 協定 / 埠 | 用途 | 使用者 |
+|------|----------|------|--------|
+| Control Plane 入站 | TCP 6443 | kube-apiserver | 所有節點、kubectl 使用者 |
+| Control Plane 入站 | TCP 2379–2380 | etcd client / peer | apiserver、其他 etcd |
+| Control Plane 入站 | TCP 10250 | kubelet API | apiserver（logs / exec） |
+| Control Plane 入站 | TCP 10257 | kube-controller-manager | 本機 |
+| Control Plane 入站 | TCP 10259 | kube-scheduler | 本機 |
+| Worker 入站 | TCP 10250 | kubelet API | apiserver |
+| Worker 入站 | TCP 10256 | kube-proxy 健康檢查 | LB |
+| Worker 入站 | TCP 30000–32767 | NodePort Service | 外部使用者 |
+| 所有節點互通 | UDP 8472 | Flannel / Cilium VXLAN | 所有節點 |
+| 所有節點互通 | UDP 4789 | Calico VXLAN | 所有節點 |
+| 所有節點互通 | TCP 179 | Calico BGP | 所有節點 |
+
+本指南在測試環境直接關閉 UFW；正式環境應只開放上表。
+
+#### 5.8 DNS 與主機名稱
+
+- 每個節點需有**唯一**的 hostname、MAC address、`/sys/class/dmi/id/product_uuid`（VM 複製時常重複，kubeadm 會報錯）。
+- 節點需能互相解析 hostname（`/etc/hosts` 或內部 DNS）。
+- 決定叢集內部 DNS 網域（預設 `cluster.local`，若多叢集需互通建議改為 `<cluster-name>.local`，**init 後不可變更**）。
+
+#### 5.9 網際網路存取與 Proxy
+
+| 情境 | 需準備 |
+|------|--------|
+| 可直接連外 | 無 |
+| 需經 Proxy | containerd 的 `HTTP_PROXY` / `NO_PROXY`（**NO_PROXY 必須包含 Node、Pod、Service 三個 CIDR**，否則 apiserver 流量被送到 Proxy） |
+| 完全離線（air-gap） | 私有 registry（Harbor）、預先 `kubeadm config images pull` 並推送、apt 套件鏡像、Flannel/CNI 映像 |
+
+---
+
+### 六、儲存需求
+
+#### 6.1 需求釐清
+
+| 問題 | 若答「是」的影響 |
+|------|----------------|
+| 有需要持久化的資料嗎（資料庫、上傳檔案）？ | 需要 PV/PVC 與 StorageClass，不能只靠 `emptyDir` |
+| 多個 Pod 需同時讀寫同一份資料（RWX）嗎？ | 排除 block storage（iSCSI、雲端磁碟），需 NFS / CephFS / 物件儲存 |
+| 需要快照、複製、災難復原嗎？ | 需支援 CSI Snapshot 的 driver |
+| 資料庫需要多少 IOPS？ | 決定 SSD vs HDD、本地 vs 網路儲存 |
+| 資料是否需要跨可用區複製？ | 雲端需選 regional disk；地端需 Ceph / Longhorn 多副本 |
+
+#### 6.2 儲存方案決策表
+
+| 方案 | 存取模式 | 適用 | 需事先準備 |
+|------|---------|------|-----------|
+| `hostPath` / `local` PV | RWO | 學習、單節點測試 | 無；但 Pod 綁死在特定節點 |
+| NFS（`nfs-subdir-external-provisioner`） | RWX | 開發環境、小型正式 | NFS 伺服器、所有節點裝 `nfs-common` |
+| Longhorn / OpenEBS | RWO（Longhorn 可 RWX） | 地端正式，無外部儲存設備 | 每節點額外磁碟、`open-iscsi` |
+| Rook-Ceph | RWO / RWX / Object | 地端大型正式 | ≥ 3 節點各一顆裸磁碟、足夠記憶體（每 OSD 4 GB） |
+| 雲端 CSI（EBS / PD / Azure Disk） | RWO | 公有雲 | IAM 權限、CSI driver |
+| 企業儲存 CSI（NetApp Trident、Pure、Dell） | 依設備 | 已有 SAN/NAS | 廠商 CSI driver、儲存端帳號 |
+
+> 詳細原理見後方「存儲原理深度說明」章節。此處只需在安裝前決定**要不要**、**用哪一種**、**誰提供後端**。
+
+---
+
+### 七、安全與合規需求
+
+安全需求中有幾項**必須在 `kubeadm init` 時透過設定檔啟用**，事後補加需要修改 apiserver static Pod manifest，較為麻煩。
+
+| 需求 | 實作機制 | 是否需在 init 時決定 | 說明 |
+|------|---------|:------------------:|------|
+| **稽核日誌**（誰在何時做了什麼） | apiserver `--audit-policy-file` / `--audit-log-path` | ✅ 建議 | 合規要求（ISO 27001、金融業）幾乎必備；需規劃日誌保留天數與磁碟空間 |
+| **Secret 靜態加密** | `EncryptionConfiguration` + `--encryption-provider-config` | ✅ 建議 | 未加密時任何能讀 etcd 的人都能看到所有 Secret 明文 |
+| **NetworkPolicy** | CNI 支援 | ✅（CNI 選型） | Flannel 不支援，需 Calico / Cilium |
+| **Pod Security Admission** | Namespace label（`pod-security.kubernetes.io/enforce`） | ❌ | 可事後啟用；建議正式環境至少 `baseline`，敏感 Namespace 用 `restricted` |
+| **RBAC 分權** | Role / ClusterRole / RoleBinding | ❌ | kubeadm 預設啟用 RBAC；需規劃團隊 → Namespace → 角色對應表 |
+| **使用者身分驗證** | apiserver `--oidc-issuer-url` 等 | ✅ 建議 | 對接 Keycloak / Azure AD / Google，避免分發 admin.conf |
+| **憑證輪替** | kubeadm 自動核發 1 年憑證、CA 10 年 | ❌ | 需規劃每年 `kubeadm certs renew` 或啟用 kubelet 自動輪替（預設開啟） |
+| **CIS Benchmark** | kube-bench 掃描 | ❌ | 見後方 CKS 章節；安裝後執行並修正 FAIL 項目 |
+| **映像檔安全** | 私有 registry、映像掃描、簽章驗證（cosign） | ❌ | 需決定是否禁止拉取 Docker Hub 公開映像 |
+| **etcd 存取控制** | etcd 只監聽 Control Plane 內部介面 | ❌ | kubeadm 預設已做；確認防火牆不對外開 2379 |
+
+**合規需求對照：**
+
+| 規範 | 通常要求的項目 |
+|------|--------------|
+| CIS Kubernetes Benchmark | 稽核、加密、RBAC、Pod Security、kubelet 認證 |
+| ISO 27001 / SOC 2 | 稽核日誌保存 ≥ 1 年、存取控制、變更紀錄 |
+| 個資法 / GDPR | Secret 加密、資料所在地、刪除機制 |
+| PCI DSS | 網路隔離（NetworkPolicy）、加密傳輸、稽核 |
+
+---
+
+### 八、版本選型與相容性
+
+#### 8.1 Kubernetes 版本策略
+
+- Kubernetes 每年釋出 **3 個 minor 版本**，每個版本支援約 **14 個月**。
+- 同一時間只有**最新 3 個 minor 版本**受支援。安裝時選最新版減一（例如最新是 1.33，選 1.32）通常最穩：問題已被踩過、又不會太快 EOL。
+- **升級只能一次一個 minor 版本**（1.30 → 1.31 → 1.32），不能跳版。若選了太舊的版本，日後追版本會很痛苦。
+
+#### 8.2 元件版本偏差規則（Version Skew Policy）
+
+| 元件 | 相對於 kube-apiserver 的允許版本 |
+|------|-------------------------------|
+| kubelet | 可舊 **3** 個 minor（1.28 起），不可比 apiserver 新 |
+| kube-controller-manager / kube-scheduler | 可舊 1 個 minor，不可比 apiserver 新 |
+| kube-proxy | 可舊 3 個 minor，不可比 apiserver 新 |
+| kubectl | ±1 個 minor |
+| kubeadm | 與目標版本相同（升級時先升 kubeadm） |
+
+這決定了升級順序：**apiserver（Control Plane）→ kubelet/kube-proxy（Worker）→ kubectl**。
+
+#### 8.3 相容性矩陣
+
+安裝前確認以下組合，並記錄在決策表中：
+
+| 元件 | 本指南版本 | 選型依據 / 注意事項 |
+|------|-----------|-------------------|
+| OS | Ubuntu 24.04 LTS | 支援至 2029；核心 6.8 原生 cgroup v2；`bento/ubuntu-24.04` box 現成可用 |
+| 核心 | ≥ 5.10 建議 | Cilium eBPF 需求；VXLAN 與 nf_conntrack 在 4.x 即可 |
+| cgroup driver | `systemd` | Ubuntu 24.04 為 cgroup v2，**containerd 與 kubelet 必須一致使用 systemd**，否則 kubelet 反覆重啟 |
+| Kubernetes | 1.32 | 撰寫時的穩定版；`pkgs.k8s.io` 套件庫依 minor 版本分開 |
+| containerd | Ubuntu 套件庫版本（1.7.x） | 需 ≥ 1.6 支援 CRI v1；使用 Docker 套件庫的 `containerd.io` 亦可 |
+| runc | 隨 containerd | |
+| CNI plugins | Flannel 自帶 | 若自行安裝需 ≥ 1.0 |
+| Flannel | v0.25.5 | 支援 K8s 1.32；需搭配 `net-conf.json` Network 與 Pod CIDR 一致 |
+| Calico（若選用） | 3.29+ | 需確認官方相容表支援目標 K8s 版本 |
+| Cilium（若選用） | 1.16+ | 同上 |
+
+> **檢查方式：** 每個 CNI / CSI 專案的 release note 或文件都有「Supported Kubernetes versions」表格，安裝前務必核對，不要假設最新版一定相容。
+
+---
+
+### 九、營運需求：監控、日誌、備份、升級
+
+叢集裝好只是開始。以下項目在安裝前就應決定「要不要做、誰來做」，否則第一次出事才會發現什麼都沒有。
+
+| 面向 | 需釐清的問題 | 建議方案 | 需預留 |
+|------|-------------|---------|--------|
+| **指標監控** | 要看到 Pod CPU/記憶體嗎？要告警嗎？ | `metrics-server`（HPA 必需）+ kube-prometheus-stack | Prometheus 需持久儲存（每節點每天約 1–2 GB） |
+| **日誌集中** | 容器日誌要保留多久？誰會查？ | Loki + Promtail 或 EFK | 儲存空間；日誌保留政策 |
+| **etcd 備份** | 可接受遺失多少分鐘的叢集狀態（RPO）？ | `etcdctl snapshot save` 排程（每小時 / 每日）+ 異地存放 | 備份目的地；還原演練時程 |
+| **憑證管理** | 誰負責每年更新憑證？ | `kubeadm certs check-expiration` 加入監控；升級時自動更新 | 告警規則（到期前 30 天） |
+| **升級策略** | 多久升級一次？維護時段？ | 每 6 個月跟進一個 minor；先在測試叢集演練 | 測試叢集；Worker drain 時的容量餘裕 |
+| **叢集狀態備份** | 除了 etcd，YAML 定義存哪？ | GitOps（Argo CD / Flux），所有資源進 Git | Git repo；CI/CD 流程 |
+| **容量告警** | 磁碟 / Pod IP / 節點資源用到多少要通知？ | 磁碟 80%、Pod CIDR 用量 70%、節點 CPU request 80% | 告警通道（Slack / Email / PagerDuty） |
+
+---
+
+### 十、需求分析輸出：安裝決策表
+
+需求分析完成後，產出這張表，作為安裝時的唯一依據。右欄「事後可否變更」提醒哪些項目一定要在此刻確定。
+
+以下是**本指南範例環境**的決策表：
+
+| 決策項目 | 選項 | 本指南採用值 | 事後可否變更 |
+|---------|------|------------|:-----------:|
+| 叢集用途 | 學習 / 開發 / 正式 | 學習與 CKA/CKS 練習 | — |
+| 節點數與規格 | — | 1 master（2 vCPU / 4 GB）+ 2 worker（2 vCPU / 2 GB） | ✅ 可加節點 |
+| OS | — | Ubuntu 24.04 LTS | ❌ 換 OS = 重裝節點 |
+| Kubernetes 版本 | — | 1.32 | ⚠️ 只能逐 minor 升級 |
+| CRI | containerd / CRI-O | containerd（systemd cgroup） | ⚠️ 需逐節點 drain 重設 |
+| Control Plane 拓撲 | 單一 / Stacked HA / External etcd | 單一 | ❌ 未設 endpoint，升 HA 需重簽憑證 |
+| `--control-plane-endpoint` | DNS / VIP / 未設定 | 未設定（直接用 192.168.56.10） | ❌ 極難 |
+| Node Network | — | 192.168.56.0/24（VirtualBox Host-only） | ❌ |
+| Pod CIDR | — | 10.244.0.0/16（每節點 /24，最多 256 節點） | ❌ 需重建叢集 |
+| Service CIDR | — | 10.96.0.0/12（預設） | ❌ 1.33+ 可用 ServiceCIDR 物件擴充，仍不建議 |
+| 叢集 DNS 網域 | — | cluster.local（預設） | ❌ |
+| CNI | Flannel / Calico / Cilium | Flannel v0.25.5（VXLAN，`--iface=eth1`） | ⚠️ 可換，需重建所有 Pod 網路 |
+| kube-proxy 模式 | iptables / IPVS / eBPF | iptables（預設） | ✅ 改 ConfigMap 後重啟 |
+| 對外入口 | NodePort / MetalLB / Ingress | NodePort（CKA 練習） | ✅ |
+| 儲存 | — | 無 StorageClass（練習時用 hostPath / local PV） | ✅ |
+| 稽核日誌 | 開 / 關 | 關（CKS 章節練習時手動開啟） | ⚠️ 需改 apiserver manifest |
+| Secret 加密 | 開 / 關 | 關（CKS 章節練習時手動開啟） | ⚠️ 需改 apiserver manifest 並重寫 Secret |
+| Pod Security Admission | — | 未設定（CKS 章節練習） | ✅ |
+| 身分驗證 | admin.conf / OIDC | admin.conf | ⚠️ 加 OIDC 需改 apiserver manifest |
+| 防火牆 | — | 關閉 UFW | ✅ |
+| 監控 / 日誌 / 備份 | — | 無（練習環境可隨時 `vagrant destroy` 重建） | ✅ |
+
+#### 將決策表轉成 kubeadm 設定檔
+
+決策確定後，建議以 **kubeadm 設定檔**取代命令列參數，設定檔可進版控、可審閱、可重現。以下是把上表（並加上正式環境常見的幾項選擇）轉成 `kubeadm-config.yaml` 的範例：
+
+```yaml
+# kubeadm-config.yaml
+# 用法：kubeadm init --config kubeadm-config.yaml
+apiVersion: kubeadm.k8s.io/v1beta4
+kind: InitConfiguration
+localAPIEndpoint:
+  advertiseAddress: 192.168.56.10        # ← 決策：多網卡時選 Host-only 介面
+  bindPort: 6443
+nodeRegistration:
+  criSocket: unix:///var/run/containerd/containerd.sock   # ← 決策：CRI = containerd
+  kubeletExtraArgs:
+    - name: node-ip
+      value: 192.168.56.10               # ← 決策：避免 kubelet 選到 NAT 介面
+---
+apiVersion: kubeadm.k8s.io/v1beta4
+kind: ClusterConfiguration
+clusterName: k8s-lab                     # ← 決策：叢集名稱（出現在 kubeconfig context）
+kubernetesVersion: v1.32.0               # ← 決策：版本
+# controlPlaneEndpoint: k8s-api.example.com:6443   # ← 決策：正式環境務必設定（本指南練習環境未設）
+networking:
+  podSubnet: 10.244.0.0/16               # ← 決策：Pod CIDR，須與 Flannel net-conf.json 一致
+  serviceSubnet: 10.96.0.0/12            # ← 決策：Service CIDR
+  dnsDomain: cluster.local               # ← 決策：叢集 DNS 網域
+apiServer:
+  extraArgs:
+    # ← 決策：正式環境啟用稽核日誌（練習環境可省略）
+    - name: audit-policy-file
+      value: /etc/kubernetes/audit/policy.yaml
+    - name: audit-log-path
+      value: /var/log/kubernetes/audit/audit.log
+    - name: audit-log-maxage
+      value: "30"
+    # ← 決策：Secret 靜態加密（練習環境可省略）
+    # - name: encryption-provider-config
+    #   value: /etc/kubernetes/enc/enc.yaml
+  extraVolumes:
+    - name: audit-policy
+      hostPath: /etc/kubernetes/audit
+      mountPath: /etc/kubernetes/audit
+      readOnly: true
+      pathType: DirectoryOrCreate
+    - name: audit-log
+      hostPath: /var/log/kubernetes/audit
+      mountPath: /var/log/kubernetes/audit
+      pathType: DirectoryOrCreate
+controllerManager:
+  extraArgs:
+    - name: node-cidr-mask-size
+      value: "24"                        # ← 決策：每節點 Pod 子網大小
+etcd:
+  local:
+    dataDir: /var/lib/etcd               # ← 決策：正式環境掛獨立 SSD 到此路徑
+---
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+cgroupDriver: systemd                    # ← 決策：與 containerd 一致
+maxPods: 110                             # ← 決策：每節點 Pod 上限（須 < 子網可用 IP 數）
+# 正式環境建議明確保留系統資源（見 3.2 Sizing 公式）
+# kubeReserved:
+#   cpu: 500m
+#   memory: 1Gi
+# systemReserved:
+#   cpu: 500m
+#   memory: 512Mi
+---
+apiVersion: kubeproxy.config.k8s.io/v1alpha1
+kind: KubeProxyConfiguration
+mode: iptables                           # ← 決策：iptables / ipvs
+```
+
+> 用 `kubeadm config print init-defaults` 可以印出所有預設值作為起點；用 `kubeadm init --config kubeadm-config.yaml --dry-run` 可在不改動系統的情況下驗證設定檔。
+
+---
+
+### 十一、需求收集範本（可複製使用）
+
+以下範本可直接複製到專案 Wiki 或 issue，逐項填寫後即成為安裝依據。
+
+```markdown
+# Kubernetes 叢集需求收集表
+
+- 叢集名稱：
+- 需求提出單位 / 聯絡人：
+- 填寫日期：
+- 預計上線日期：
+
+## 1. 用途與情境
+- [ ] 學習 / 實驗　[ ] 開發 / 測試　[ ] 正式營運　[ ] 其他：
+- 主要工作負載類型（Web / DB / 批次 / AI）：
+- 使用團隊數量與人數：
+- 可接受的停機時間（每月）：
+
+## 2. 規模
+- 初期 Pod 數：　　　　1 年後預估：　　　　2 年後預估：
+- 初期節點數：　　　　1 年後預估：　　　　2 年後預估：
+- 單一 Pod 最大資源需求（CPU / 記憶體）：
+- 是否需要 GPU：[ ] 是　[ ] 否
+
+## 3. 高可用性
+- Control Plane：[ ] 單一　[ ] 3 台 Stacked　[ ] External etcd
+- Control Plane Endpoint（DNS / VIP）：
+- 負載平衡器方案：
+
+## 4. 網路（需網路團隊確認）
+- Node Network：
+- Pod CIDR：　　　　　　（已確認不與 ______ 重疊）
+- Service CIDR：　　　　（已確認不與 ______ 重疊）
+- 叢集 DNS 網域：
+- CNI：[ ] Flannel　[ ] Calico　[ ] Cilium
+- 需要 NetworkPolicy：[ ] 是　[ ] 否
+- 節點是否多網卡：[ ] 是（叢集介面：______）　[ ] 否
+- 實體 MTU：　　　　底層是否已有 overlay：[ ] 是　[ ] 否
+- 對外入口：[ ] NodePort　[ ] MetalLB（IP 池：______）　[ ] 雲端 LB　[ ] Ingress
+- 連外方式：[ ] 直連　[ ] Proxy（位址：______）　[ ] 離線（registry：______）
+- 防火牆申請單號：
+
+## 5. 儲存
+- 需要持久儲存：[ ] 是　[ ] 否
+- 需要 RWX：[ ] 是　[ ] 否
+- 需要快照 / 備份：[ ] 是　[ ] 否
+- 方案：[ ] local　[ ] NFS　[ ] Longhorn　[ ] Ceph　[ ] 雲端 CSI　[ ] 企業儲存：______
+- 預估容量：　　　　IOPS 需求：
+
+## 6. 安全與合規
+- 適用規範：[ ] CIS　[ ] ISO 27001　[ ] 個資法　[ ] PCI DSS　[ ] 其他：
+- 稽核日誌：[ ] 啟用（保留 ___ 天）　[ ] 不啟用
+- Secret 靜態加密：[ ] 啟用　[ ] 不啟用
+- 身分驗證：[ ] kubeconfig　[ ] OIDC（Provider：______）
+- Pod Security 等級：[ ] privileged　[ ] baseline　[ ] restricted
+- 映像來源限制：[ ] 僅私有 registry　[ ] 不限制
+
+## 7. 版本
+- OS：　　　　　Kubernetes：　　　　　CRI：
+- CNI 版本：　　　CSI 版本：
+- 相容性已核對：[ ] 是（核對者：______）
+
+## 8. 營運
+- 監控方案：　　　　　負責人：
+- 日誌方案：　　　　　保留天數：
+- etcd 備份頻率：　　　備份存放位置：
+- 升級週期：　　　　　維護時段：
+- GitOps：[ ] 是（repo：______）　[ ] 否
+
+## 9. 決策紀錄
+| 日期 | 決策項目 | 決定 | 決策者 | 理由 |
+|------|---------|------|--------|------|
+|      |         |      |        |      |
+```
+
+---
+
 ## 方法二：手動逐步安裝（含原理說明）
 
 ## 環境需求
+
+> 以下環境是依「安裝前需求收集與分析」第十節決策表所選定的**學習用**組態。正式環境請依該章重新評估節點規格、HA 拓撲與網段規劃。
 
 | 主機名稱 | IP 位址 | 記憶體 |
 |---------|---------|--------|
