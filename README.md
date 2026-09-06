@@ -25,6 +25,8 @@
 .
 ├── Vagrantfile
 ├── README.md
+├── .gitignore      # 排除 .vagrant/ 與內含有效 token 的 join-command.sh
+├── join-command.sh  # master 佈建時自動產生（含有效 token，已列入 .gitignore）
 └── scripts/
     ├── common.sh   # 所有節點共用（containerd、kubeadm、kubelet、kubectl）
     ├── master.sh   # Master 節點初始化與 Flannel 部署
@@ -124,6 +126,191 @@ kubectl config delete-context kubernetes-admin@kubernetes
 2. **佈建順序**：Vagrant 依定義順序依序佈建（master → worker1 → worker2），Worker 腳本會自動等待 Master 完成。
 3. **VirtualBox Host-only 網路**：VirtualBox 6.1.28+ 預設允許 `192.168.56.0/21` 網段，本指南使用的 IP（192.168.56.10-12）在此範圍內。
 4. **重新佈建**：若需重建叢集，執行 `vagrant destroy -f && vagrant up`。
+5. **重複佈建**：`vagrant provision` 可安全重跑——master／worker 皆會偵測叢集是否已存在並略過初始化，不會破壞既有節點。
+6. **join token 效期 24 小時**：隔天才要加入新 worker 時，先執行 `vagrant provision k8s-master` 換發，再啟動該 worker。
+7. **設計背景**：各項取捨的理由整理在下一章「自動化腳本的需求、設計決策與原則」。
+
+---
+
+## 自動化腳本的需求、設計決策與原則
+
+腳本本身說明「做了什麼」，這一章說明「為什麼這樣做」，以及「不這樣做會發生什麼事」。
+每支腳本的檔頭都有對應的精簡版註解（R / D / P 編號可互相對照）。
+
+---
+
+### 一、需求（Requirements）
+
+| 編號 | 需求 | 驗收方式 |
+|------|------|----------|
+| R1 | 一道 `vagrant up` 產出可用的 3 節點叢集（1 master + 2 worker） | `kubectl get nodes` 三個節點皆 `Ready` |
+| R2 | 節點之間、host → 節點都有穩定可預測的 IP | `kubectl get nodes -o wide` 的 `INTERNAL-IP` 為 192.168.56.10/11/12 |
+| R3 | 跨節點 Pod 可直接互通 | 不同節點的兩個 Pod 互 ping 成功 |
+| R4 | 可在 Windows / macOS / Linux host 上執行 | Windows 11 + Vagrant 2.4.9 實測（本專案的主力環境） |
+| R5 | 版本可重現：今天與下個月跑出來的元件版本一致 | `kubelet --version`、`containerd --version` 與釘選值相符 |
+| R6 | 可重複執行：`vagrant provision` 重跑不得破壞既有叢集 | 對已就緒的叢集重跑，節點仍 `Ready`，dotfile 無重複行 |
+| R7 | 失敗要當場停、且訊息能指出下一步 | 任一斷言失敗時 provisioning 中止並印出修復指令 |
+
+---
+
+### 二、設計決策（Design Decisions）
+
+每一項都用「決策 → 替代方案 → 為何這樣選 → 付出的代價」來記錄。
+**代價欄不是免責聲明，是提醒你哪天需求變了要回來改哪裡。**
+
+#### D1　Vagrant + VirtualBox，而不是 kind / minikube
+
+- **替代方案**：kind（容器內跑節點）、minikube、雲端 VM。
+- **理由**：本專案的目的是把 kubeadm 的每一步、以及節點層的設定（swap、cgroup driver、核心模組、CNI 介面選擇）**攤開來看**。kind 把這些全部藏在容器映像裡，正好蓋掉要學的東西。真 VM 也才能練 `kubeadm reset`、節點重開機、etcd 備份還原。
+- **代價**：起得慢（15–25 分鐘）、吃記憶體（10GB），且與雲端的網路模型仍有差距。
+
+#### D2　三節點（1 master + 2 worker）
+
+- **替代方案**：單節點（拿掉 control-plane taint）、或 3 master 的 HA。
+- **理由**：**兩個** worker 才能觀察到「跨節點」的行為——VXLAN 封裝、Service 的跨節點負載平衡、`nodeSelector` / taint 造成的排程差異。只有一個 worker 時，這些路徑全部退化成同節點通訊，看不出差別。
+- **代價**：沒有 control plane HA，etcd 是單點。HA 的 join 流程（`--control-plane --certificate-key`）不在本專案範圍。
+
+#### D3　腳本切成 common / master / worker 三段
+
+- **替代方案**：一支大腳本用 `if [ "$ROLE" = master ]` 分流。
+- **理由**：節點層的前置作業（swap、核心模組、containerd、kubeadm 套件）在三種角色上**必須完全相同**，抽成 `common.sh` 可以在結構上保證這件事，而不是靠人記得同步三份副本。
+- **代價**：多了一層檔案；參數要靠 provision 的 `env:` 傳遞。
+
+#### D4　host-only 私有網路 + 固定 IP
+
+- **替代方案**：只用 VirtualBox 預設的 NAT 網卡。
+- **理由**：NAT 網卡在三台 VM 上**都是 10.0.2.15**，彼此無法定址。叢集的所有通訊（apiserver、etcd、kubelet、Flannel VXLAN）都必須走 host-only 那張網卡。選 `192.168.56.0/24` 是因為它是 VirtualBox 預設放行的網段，使用者不必去改 `/etc/vbox/networks.conf`。
+- **代價**：與 host 的其他 192.168.56.x 服務可能撞號。
+
+#### D5　containerd 取自 Docker 官方 repo
+
+- **替代方案**：Ubuntu universe 的 `containerd` 套件。
+- **理由**：Docker repo 對每個 Ubuntu 版本都同步供貨且緊跟上游；Ubuntu 內建版本會隨發行版凍結，換 box 版本時 runtime 行為就會跟著變，牴觸 R5。
+- **代價**：多一個外部 apt 來源。另外要注意**該 repo 現在供的是 containerd 2.x**（設定檔為 `version = 3`，plugin key 從 `io.containerd.grpc.v1.cri` 改成 `io.containerd.cri.v1.*`）。本專案的 `sed` 都刻意不綁 plugin 區塊名稱，1.x / 2.x 皆適用。
+
+#### D6　`SystemdCgroup = true`
+
+- **替代方案**：維持預設的 cgroupfs，改讓 kubelet 也用 cgroupfs。
+- **理由**：Ubuntu 24.04 是 cgroup v2 + systemd，kubelet 預設就是 systemd driver。**兩邊不一致時，會有兩個 process 各自管理同一組 cgroup**，症狀是節點在負載升高時隨機 `NotReady`，而且極難歸因——這不是效能調校，是正確性問題。
+- **代價**：無。這是官方建議值。
+
+#### D7　Flannel，而不是 Calico / Cilium
+
+- **替代方案**：Calico（支援 NetworkPolicy）、Cilium（eBPF）。
+- **理由**：Flannel 的 VXLAN 後端只有一層封裝，路由規則用 `ip route`、`bridge fdb` 就看得完，可以逐條對照 README 的網路原理章節驗證。
+- **代價**：**Flannel 不實作 NetworkPolicy**。README 的 NetworkPolicy 章節與 CKS 題目需要另外換成 Calico 或 Cilium。這是刻意接受的取捨。
+
+#### D8　`--node-ip` 與 flanneld `--iface` 都明確指定
+
+- **替代方案**：讓 kubelet 與 flanneld 自動選介面。
+- **理由**：兩者的自動選擇都會挑到預設路由的介面，也就是 NAT 的 10.0.2.15。後果分別是「三個節點的 InternalIP 一模一樣，apiserver 連不到 kubelet（`logs`、`exec` 全掛）」與「VXLAN 外層目的位址全部相同，跨節點流量送不出去」。
+- **代價**：`--iface` 需要在執行期偵測介面名稱。腳本改為從「IP 落在 192.168.56.0/24 的介面」反推名稱，不寫死 `enp0s8`，因為介面命名會隨 box 與 VirtualBox 版本改變。
+
+#### D9　join 指令透過 synced folder 傳遞
+
+- **替代方案**：host 端腳本 `vagrant ssh master -c ...` 抓出來再塞給 worker；或用外部 KV store。
+- **理由**：`/vagrant` 是三台 VM 唯一的共享媒介，不需要額外元件，而且 `vagrant up k8s-worker2` 這種單機啟動也能運作。
+- **代價**：需要處理三件事，腳本中都已處理——
+  1. **半成品**：master 先寫 `.join-command.tmp` 再 `mv`；worker 除了檢查檔案存在，還會確認內容含 `kubeadm join`。
+  2. **過期**：token 預設效期 24 小時。master 每次 provision 都會換發，因此隔天要加節點時先 `vagrant provision k8s-master`。
+  3. **機密**：這個檔案內含**有效的 bootstrap token + CA 公鑰雜湊**，等同叢集的入場券，因此列入 `.gitignore`，且 master 開機前會清掉舊檔。
+
+#### D10　版本釘選 + `apt-mark hold`
+
+- **替代方案**：一律裝最新版。
+- **理由**：教學環境的價值在於「今天壞掉的原因和明天一樣」。另外 Kubernetes 的升級有嚴格順序（kubeadm → control plane → kubelet）且一次只能跨一個 minor 版本，被 unattended-upgrades 打斷會直接壞掉。
+- **代價**：釘選的版本會過時，需要人工回來更新（見下方「如何安全地升版」）。
+
+#### D11　Vagrant trigger 用 Ruby block，不用 inline shell
+
+- **替代方案**：`trigger.run = { inline: "rm -f ..." }`（本專案原本的寫法）。
+- **理由**：**inline trigger 在 Windows host 上是交給 PowerShell 執行的**
+  （`vagrant/plugin/v2/trigger.rb`：`Platform.windows?` → `PowerShell.execute_inline`）。
+  在 PowerShell 中 `rm -f <path>` 會被解析成 `Remove-Item -f`，而 `-f` 同時符合 `-Filter` 與 `-Force`
+  → 參數歧義錯誤 → exit code 1 → trigger 預設 `on_error :halt` → **`vagrant up` 直接中止**。
+- **代價**：無。`trigger.ruby` 由 Vagrant 自己的 Ruby runtime 執行，三大平台行為一致。
+
+---
+
+### 三、原則（Principles）
+
+這七條是上面所有決策共用的判準。腳本裡的註解會用 P 編號回指這裡。
+
+| 編號 | 原則 | 在腳本中的具體樣子 |
+|------|------|--------------------|
+| **P1** | **Fail fast** — 寧可當場停，也不要留下「看起來成功、其實半殘」的節點 | 三支腳本都 `set -euo pipefail`；必要變數用 `${VAR:?訊息}` 取值 |
+| **P2** | **設定完就驗證** — `sed` 沒比對到任何東西時 exit code 仍然是 0，沉默的失敗比壞掉更貴 | swap、sysctl、`SystemdCgroup`、Flannel `--iface`、pod CIDR 一致性，每一項後面都跟一個斷言 |
+| **P3** | **冪等** — 重跑一次的結果要和跑一次相同 | `kubeadm init` / `join` 先檢查 `admin.conf` / `kubelet.conf`；寫 dotfile 前先 `grep -qxF`；`/etc/default/kubelet` 用 `>` 覆寫而非 `>>` 附加 |
+| **P4** | **版本釘選** — 不用 latest | `K8S_VERSION`、`BOX_NAME`、`FLANNEL_VERSION` 都是檔頭常數；`apt-mark hold` |
+| **P5** | **錯誤訊息要附可直接複製的下一步** | join 逾時／失敗時直接印出 `vagrant provision k8s-master` 等指令 |
+| **P6** | **機密不進版控** | `.gitignore` 排除 `join-command.sh` 與 `.vagrant/`；kubeconfig 設為 `0600` |
+| **P7** | **host 端只做 Vagrant 做得到的事** | 任何需要 shell 的動作都放進 guest 腳本——guest 的 bash 環境是我們控制得了的，host 的不是（見 D11） |
+
+---
+
+### 四、驗證報告
+
+#### 4.1 驗證方式
+
+| 對象 | 方式 | 結果 |
+|------|------|------|
+| 三支 shell 腳本 | `bash -n` 語法檢查 | 通過 |
+| 三支 shell 腳本 | ShellCheck 0.10.0（`-S style`，排除 SC1091） | 無告警 |
+| `Vagrantfile` | Vagrant 2.4.9 內建 Ruby 的 `ruby -c` | Syntax OK |
+| Flannel manifest | 實際下載 v0.25.5，檢查 `--kube-subnet-mgr` 出現次數與縮排、`net-conf.json` 的 Network | 全檔剛好 1 次、8 格縮排；Network = `10.244.0.0/16`，與 `--pod-network-cidr` 一致 |
+| Flannel patch | 用真實 manifest 當 fixture 實跑 `sed`，確認插入位置與只改一處 | 通過（212 → 213 行，`--iface` 出現 1 次） |
+| containerd 設定 patch | 用 1.x（`version = 2`）與 2.x（`version = 3`）兩種格式的 fixture 實跑 | 兩種格式都正確改到，且未誤傷 `sandboxer` |
+| 上游套件庫 | 查詢 `pkgs.k8s.io` v1.32 與 Docker noble repo 的實際供貨 | kubeadm/kubelet/kubectl 1.32.0–1.32.13 皆在；`containerd.io` 現為 2.3.4 |
+| pause 映像版本 | 比對 kubeadm 1.32 的 `PauseVersion` 與 containerd 2.3 的 `DefaultSandboxImage` | 3.10 vs 3.10.2，**不一致**（已處理，見 F10） |
+| `worker.sh` | 6 個情境測試（檔案不存在／空檔／內容不完整／內容合法／join 失敗／節點已加入） | 6 項全部符合預期 |
+| Vagrant trigger | 閱讀 Vagrant 2.4.9 原始碼確認 Windows 走 PowerShell，並實際重現 `rm -f` 的錯誤與 exit code | 重現成功（見 F1） |
+
+> **未驗證的部分（誠實聲明）**：撰寫本報告的機器上**沒有安裝 VirtualBox、也沒有任何 Vagrant box**，
+> 因此**沒有跑過端到端的 `vagrant up`**。上表全部是靜態分析、對真實上游檔案的斷言測試，以及對腳本邏輯的隔離測試。
+> 首次實跑時請留意 4.3 節列出的殘留風險。
+
+#### 4.2 找到並修正的問題
+
+| # | 嚴重度 | 問題 | 症狀 | 修正 |
+|---|--------|------|------|------|
+| F1 | 🔴 **阻斷（Windows）** | `Vagrantfile` 的 inline trigger 用了 `rm -f`，但 Windows 上 inline trigger 交給 PowerShell 執行 | `Remove-Item -f` 參數歧義 → exit 1 → trigger `on_error :halt` → **`vagrant up` 在 master 開機前就中止**；即使繞過，舊的過期 join 檔也不會被清掉 | 改用 `trigger.ruby` block + `File.delete`，跨平台一致（D11） |
+| F2 | 🟠 高 | 停用 swap 的 regex 只比對 `" swap "`（前後空白） | Ubuntu 24.04 的 `/etc/fstab` 是 **TAB 分隔**（`/swap.img<TAB>none<TAB>swap`），比對不到 → 當下 `swapoff -a` 有效，**重開機後 swap 回來 → kubelet 起不來**（正是本文件「問題一」的症狀） | 改用容忍任意空白的 regex，且只處理未註解的行；並加上 `swapon --show` 斷言 |
+| F3 | 🟠 高 | `vagrant provision` 不具冪等性 | 對已就緒的叢集重跑：master 重跑 `kubeadm init` 失敗（port／檔案已占用，可能留下半毀的 control plane）；worker 重跑 `kubeadm join` 失敗 | master 先檢查 `/etc/kubernetes/admin.conf`、worker 先檢查 `/etc/kubernetes/kubelet.conf`，已存在就略過並說明如何強制重建 |
+| F4 | 🟡 中 | `.bashrc` 每次 provision 都 `>>` 附加 | 重跑幾次後 `KUBECONFIG` 與 completion 出現多份重複行 | 加入 `add_line_once()`（`grep -qxF` 後才寫入）；`/etc/default/kubelet` 改用 `>` 覆寫 |
+| F5 | 🟡 中 | 對 `/vagrant`（vboxsf）上的檔案做 `chmod +x` | vboxsf 的權限由 mount 選項決定，`chmod` 在部分 host 上會失敗；在 `set -e` 之下會讓 master 的 provisioning 整個中斷 | 移除 `chmod`——worker 一律用 `bash <file>` 執行，執行位元本來就不需要 |
+| F6 | 🟡 中 | join 指令非原子寫入，worker 只檢查「檔案存在」 | worker 有機會讀到寫到一半的內容，或沿用上一輪的殘檔 | master 先寫 `.join-command.tmp` 再 `mv`；worker 改為檢查「非空且內容含 `kubeadm join`」 |
+| F7 | 🟡 中 | 關鍵 `sed` 沒有後置檢查 | `SystemdCgroup` 與 Flannel `--iface` 若因上游格式變動而沒改到，**exit code 仍是 0**，叢集會安靜地用錯設定（cgroup driver 不一致／VXLAN 走錯網卡） | 兩處都加上 `grep -q` 斷言，失敗時印出診斷資訊並中止（P2） |
+| F8 | 🟡 中 | 沒有 `.gitignore` | `join-command.sh`（**有效 bootstrap token + CA 公鑰雜湊**）與 `.vagrant/` 會出現在 `git status`，有被 commit 的風險 | 新增 `.gitignore` 排除兩者（P6） |
+| F9 | 🟢 低 | `master.sh` 用 `python3` 改寫 YAML，但 `common.sh` 從未安裝 python3 | 換成沒有預裝 python3 的 box 時，master 佈建會失敗 | 改用 `sed` 的 `0,/re/` 位址範圍（只改第一處），去掉這個未宣告的相依 |
+| F10 | 🟢 低 | kubeadm 與 containerd 的預設 pause 映像不一致（3.10 vs 3.10.2） | `kubeadm config images pull` 預抓的那顆不會被用到；離線或慢速網路環境會在建立第一個 Pod 時卡住 | 安裝 kubeadm 後，用 `kubeadm config images list` 的答案回寫 containerd 設定（1.x/2.x 兩種格式都處理） |
+| F11 | 🟢 低 | `crictl` 沒有 endpoint 設定 | 每次執行都印一長串警告並輪流探測 socket，排查節點問題時很干擾 | 寫入 `/etc/crictl.yaml` |
+| F12 | 🟢 低 | token 過期（24 小時）沒有診斷路徑 | 隔天 `vagrant up k8s-worker2` 會以難以理解的 `Unauthorized` 失敗 | worker 在 join 失敗時明確提示過期可能性，並印出 `vagrant provision k8s-master` 的換發步驟 |
+| F13 | 🟢 低 | ShellCheck SC2086：`$VERSION_ID` 未加引號 | 理論上的 word splitting | 加上引號 |
+
+#### 4.3 已確認正確、刻意不改的部分
+
+- **`--ignore-preflight-errors=NumCPU`**：目前每個節點都配 2 vCPU，這個豁免其實用不到。保留是為了讓使用者把 `cpus` 調成 1 時仍能起得來（會慢，但能跑）。
+- **Flannel 釘選在 v0.25.5**（上游最新已是 v0.28.x）：升版不在這次的驗證範圍內，貿然跳版會讓「manifest 格式」這個假設失效。要升版時的正確做法是——改 `FLANNEL_VERSION` → 重跑一次 → 讓腳本中的兩個斷言（Network 一致性、`--iface` 插入成功）替你確認格式沒變。**這正是 P2 存在的意義。**
+- **`ufw disable`**：教學環境的取捨。正式環境應改為只開必要埠（6443 / 2379-2380 / 10250 / 10256 / 8472-UDP），腳本註解中已註明。
+- **master 必須排在 `NODES` 陣列第一個**：Vagrant 依 `config.vm.define` 的順序開機，worker 的 join 指令由 master 產生。這個隱性相依已寫入 `Vagrantfile` 的註解（D4）。
+- **殘留風險（未經實機驗證）**：`containerd.io` 已進入 2.x，本專案的斷言可以保證「設定沒改到就會失敗」，但無法保證 containerd 2.x + kubeadm 1.32 + Flannel v0.25.5 這個組合在執行期完全沒有相容性問題。首次 `vagrant up` 時若出現異常，請優先檢查 `containerd --version` 與 `journalctl -u kubelet`。
+
+#### 4.4 如何安全地升版
+
+版本釘選（P4）的代價是要定期人工更新。建議順序：
+
+```bash
+# 1. 一次只動一個變數（Vagrantfile 的 K8S_VERSION，或 master.sh 的 FLANNEL_VERSION）
+# 2. 完整重建，不要用 provision 疊上去
+vagrant destroy -f && vagrant up
+
+# 3. 讓腳本的斷言替你檢查格式假設是否仍成立
+#    （SystemdCgroup / Flannel --iface / pod CIDR 一致性任一失敗都會當場中止）
+
+# 4. 驗證叢集
+vagrant ssh k8s-master -c "kubectl get nodes -o wide"
+vagrant ssh k8s-master -c "kubectl -n kube-system get pods"
+```
 
 ---
 
@@ -1189,7 +1376,15 @@ mode: iptables                           # ← 決策：iptables / ipvs
 
 ```bash
 sudo swapoff -a
-sudo sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab
+
+# 註解掉 /etc/fstab 中所有 swap 條目。
+# 用 [[:space:]] 而非空白字元，才涵蓋 Ubuntu 24.04 的 TAB 分隔格式（見下方「常見陷阱」）；
+# 排除已註解的行，因此重複執行也不會疊出 ## 。
+sudo sed -i -E '/^[[:space:]]*#/! s/^(.*[[:space:]]swap[[:space:]].*)$/#\1/' /etc/fstab
+
+# 驗證：以下兩個指令都應該「沒有任何輸出」
+swapon --show
+grep -E '^[^#].*[[:space:]]swap[[:space:]]' /etc/fstab
 ```
 
 > **原理說明：** Kubernetes 的記憶體管理依賴 **cgroup**：當 Container 超過 `memory limit`，cgroup 觸發 OOM Kill（記憶體不足殺程式），確保 Pod 之間互不干擾。若開啟 Swap，超過 limit 的 Container 不會被立即殺死，而是把資料寫進 Swap，導致：
@@ -1197,7 +1392,13 @@ sudo sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab
 > - 大量 Swap I/O 使節點效能劇降，但 Kubernetes 排程器不感知 Swap 使用量
 > - 節點假象「有記憶體」，Scheduler 仍排入更多 Pod，最終全部效能惡化
 >
-> `sed -i '/ swap / ...'` 將 `/etc/fstab` 中的 swap 條目註解掉，防止重啟後重新掛載。
+> 上面的 `sed` 會把 `/etc/fstab` 中的 swap 條目註解掉，防止重啟後重新掛載。
+>
+> **常見陷阱：** 很多教學寫成 `sed -i '/ swap / ...'`（前後是空白字元）。但 Ubuntu 24.04 的
+> `/etc/fstab` 是用 **TAB** 分隔的（`/swap.img<TAB>none<TAB>swap<TAB>sw<TAB>0<TAB>0`），
+> 那個寫法會完全比對不到。症狀非常容易誤判：當下 `swapoff -a` 有效，一切正常，
+> **重開機後 swap 回來，kubelet 就再也起不來**（即本文件「問題一」）。
+> 因此這裡用 `[[:space:]]` 同時容忍空白與 TAB，並在後面加上驗證指令。
 
 ### 2. 安裝必要工具
 
